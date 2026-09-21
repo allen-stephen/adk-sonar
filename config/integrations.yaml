@@ -1,0 +1,157 @@
+# Declarative integrations configuration for Voice Orchestrator & Claude Workers
+# Each entry here can be mounted onto the ADK Live Agent via McpToolset
+# (with StreamableHTTPConnectionParams + header_provider) AND/OR exported into
+# the generated .mcp.json passed to headless Claude Code (`claude -p --mcp-config`).
+
+integrations:
+  # 1. Google Workspace Remote MCP Servers (StreamableHTTPConnectionParams + header_provider)
+  google_calendar:
+    display_name: "Google Calendar MCP"
+    category: "workspace"
+    enabled: true
+    type: "streamable_http"
+    url: "https://calendarmcp.googleapis.com/mcp/v1"
+    auth_env: "GOOGLE_WORKSPACE_ACCESS_TOKEN"
+    tool_name_prefix: "calendar_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "Google Calendar MCP server for listing events, checking free/busy slots, and scheduling meetings."
+    auth_config:
+      provider: "google_workspace"
+      modes: ["oauth", "cli", "token"]
+      client_id_env: "GOOGLE_OAUTH_CLIENT_ID"
+      client_secret_env: "GOOGLE_OAUTH_CLIENT_SECRET"
+      refresh_token_env: "GOOGLE_WORKSPACE_REFRESH_TOKEN"
+      authorize_url: "https://accounts.google.com/o/oauth2/v2/auth"
+      token_url: "https://oauth2.googleapis.com/token"
+      scopes:
+        - "https://www.googleapis.com/auth/calendar"
+        - "https://www.googleapis.com/auth/gmail.modify"
+        - "https://www.googleapis.com/auth/drive.readonly"
+        - "https://www.googleapis.com/auth/userinfo.email"
+      setup_url: "https://console.cloud.google.com/apis/credentials"
+
+  gmail:
+    display_name: "Gmail MCP"
+    category: "workspace"
+    enabled: true
+    type: "streamable_http"
+    url: "https://gmailmcp.googleapis.com/mcp/v1"
+    auth_env: "GOOGLE_WORKSPACE_ACCESS_TOKEN"
+    tool_name_prefix: "gmail_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "Gmail MCP server for searching threads, reading messages, and drafting replies."
+
+  google_drive:
+    display_name: "Google Drive MCP"
+    category: "workspace"
+    enabled: true
+    type: "streamable_http"
+    url: "https://drivemcp.googleapis.com/mcp/v1"
+    auth_env: "GOOGLE_WORKSPACE_ACCESS_TOKEN"
+    tool_name_prefix: "drive_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "Google Drive MCP server for searching docs, design specs, and spreadsheets."
+
+  google_chat:
+    display_name: "Google Chat MCP"
+    category: "workspace"
+    enabled: false
+    type: "streamable_http"
+    url: "https://chatmcp.googleapis.com/mcp/v1"
+    auth_env: "GOOGLE_WORKSPACE_ACCESS_TOKEN"
+    tool_name_prefix: "gchat_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "Google Chat MCP server for reading spaces and sending messages."
+
+  # 2. First-Party ADK Grounding (Model-Internal via AgentTool)
+  google_search:
+    display_name: "Google Search Grounding"
+    category: "grounding"
+    enabled: true
+    type: "adk_builtin"
+    expose_to: ["voice_agent"]
+    description: "First-party ADK Google Search grounding for live web facts, news, and SDK documentation."
+
+  google_maps:
+    display_name: "Google Maps Grounding"
+    category: "grounding"
+    enabled: true
+    type: "adk_builtin"
+    expose_to: ["voice_agent"]
+    description: "First-party ADK Google Maps grounding for places, hours, directions, and local lookup."
+
+  # 3. GitHub, Spotify & Slack MCP Integrations
+  github:
+    display_name: "GitHub MCP"
+    category: "engineering"
+    enabled: true
+    type: "streamable_http"
+    url: "https://api.githubcopilot.com/mcp/"
+    auth_env: "GITHUB_PERSONAL_ACCESS_TOKEN"
+    tool_name_prefix: "github_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "GitHub MCP server for inspecting issues, pull requests, CI statuses, and creating draft PRs."
+    auth_config:
+      provider: "github"
+      modes: ["oauth", "cli", "token"]
+      client_id_env: "GITHUB_CLIENT_ID"
+      client_secret_env: "GITHUB_CLIENT_SECRET"
+      authorize_url: "https://github.com/login/oauth/authorize"
+      token_url: "https://github.com/login/oauth/access_token"
+      scopes: ["repo", "read:org", "workflow", "read:user"]
+      setup_url: "https://github.com/settings/developers"
+      token_url_help: "https://github.com/settings/tokens/new?scopes=repo,read:org,workflow"
+
+  spotify:
+    display_name: "Spotify"
+    category: "lifestyle"
+    enabled: true
+    type: "adk_builtin"
+    auth_env: "SPOTIFY_ACCESS_TOKEN"
+    tool_name_prefix: "spotify_"
+    expose_to: ["voice_agent"]
+    description: "Spotify playback control, focus playlists, queue management, and track lookup."
+    auth_config:
+      provider: "spotify"
+      modes: ["oauth"]
+      client_id_env: "SPOTIFY_CLIENT_ID"
+      client_secret_env: "SPOTIFY_CLIENT_SECRET"
+      refresh_token_env: "SPOTIFY_REFRESH_TOKEN"
+      authorize_url: "https://accounts.spotify.com/authorize"
+      token_url: "https://accounts.spotify.com/api/token"
+      scopes:
+        - "user-read-playback-state"
+        - "user-modify-playback-state"
+        - "user-read-currently-playing"
+        - "playlist-read-private"
+        - "user-read-email"
+      setup_url: "https://developer.spotify.com/dashboard"
+
+  slack:
+    display_name: "Slack MCP"
+    category: "assistant"
+    enabled: true
+    type: "stdio"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-slack"]
+    auth_env: "SLACK_BOT_TOKEN"
+    tool_name_prefix: "slack_"
+    expose_to: ["voice_agent", "claude_worker"]
+    description: "Slack MCP for reading channel threads, bug reports, and posting status updates."
+    auth_config:
+      provider: "slack"
+      modes: ["oauth", "token"]
+      client_id_env: "SLACK_CLIENT_ID"
+      client_secret_env: "SLACK_CLIENT_SECRET"
+      extra_env: ["SLACK_TEAM_ID"]
+      authorize_url: "https://slack.com/oauth/v2/authorize"
+      token_url: "https://slack.com/api/oauth.v2.access"
+      scopes:
+        - "channels:history"
+        - "channels:read"
+        - "chat:write"
+        - "users:read"
+        - "team:read"
+      setup_url: "https://api.slack.com/apps"
+
+

@@ -1,0 +1,249 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "discover_repositories",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Can you tell me what existing repositories you have access to in my workspace?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "list_coding_harnesses",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What coding harnesses are available in the sandbox and which one is default?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "cuj1_and_cuj2_plan_question_and_steer",
+      "agent_data": {
+        "agents": {
+          "voice_orchestrator": {
+            "agent_id": "voice_orchestrator",
+            "agent_type": "Agent",
+            "instruction": "Voice-driven engineering orchestrator."
+          }
+        },
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Start a task in plan mode on repository test-a using Claude Code to write a prime number generator script, and come back with questions first."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 1,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Check the result of that task and tell me what questions the agent has for me."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 2,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Steer that task and tell it to use a standalone module and include automated tests."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "cuj3_diff_gate_and_voice_approve",
+      "agent_data": {
+        "agents": {
+          "voice_orchestrator": {
+            "agent_id": "voice_orchestrator",
+            "agent_type": "Agent",
+            "instruction": "Voice-driven engineering orchestrator."
+          }
+        },
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Start a task on repository backend-api using Long Horizon to support the refresh token header, and require approval before pushing."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 1,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Check the result of that task and tell me what changed."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 2,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Approved. Commit and push the branch."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_spotify_music",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Put on my deep focus electronic coding playlist on Spotify while I review these diffs."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_google_search_realtime",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What are the latest breaking announcements from the Python 3.13 release notes on the web right now?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_google_maps_places",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Find a quiet coffee shop with good Wi-Fi near downtown Austin that is open right now."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_calendar_schedule",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Check my Google Calendar for today and tell me when my next free focus block is."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_gmail_inbox",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Check my unread Gmail messages and tell me if Alex sent an update on the auth service rollout."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_drive_docs",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Search my Google Drive for the token rotation PRD and tell me what grace window it specifies."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_slack_channel",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Check the eng-alerts channel on Slack and tell me if the staging canary passed."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_github_pr_status",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Check the GitHub CI status on the latest pull request for auth-svc."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "route_coding_harness_dispatch",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Dispatch a task in plan mode on auth-svc using Claude Code to refactor the Redis session store."
+          }
+        ]
+      }
+    }
+  ]
+}

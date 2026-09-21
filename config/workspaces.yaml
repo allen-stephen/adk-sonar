@@ -1,0 +1,179 @@
+# Declarative workspace & shared sandbox manifest for Voice Orchestrator.
+# Consumed by `make provision` (`scripts/provision_sandbox.py`) and runtime workspace loaders.
+# All coding harnesses (Claude Code, Antigravity, ADK Long Horizon) share this exact same
+# underlying sandbox state (packages, cloned repos, seeded files, .mcp.json, and git worktrees).
+
+workspace_root: "./workspaces"
+
+sandbox:
+  # Installed globally as CLI tools via `uv tool install`
+  uv_tools:
+    - "google-agents-cli"
+
+  # Pre-installed into the shared sandbox Python environment (`uv pip install`)
+  python_packages:
+    # 1. Google AI, ADK & Agent Protocols
+    - "google-adk[mcp,a2a,eval,gcp,otel-gcp]>=2.8.0"
+    - "google-genai>=1.0.0"
+    - "google-agents-cli"
+    - "google-cloud-aiplatform[evaluation]>=1.156.0"
+    - "a2a-sdk[http-server]>=1.0.0"
+    - "mcp>=1.8.0"
+    # 2. Web, Async & Persistence Stack
+    - "fastapi>=0.115.0"
+    - "uvicorn[standard]>=0.34.0"
+    - "httpx>=0.28.0"
+    - "aiohttp>=3.11.0"
+    - "websockets>=14.0"
+    - "pydantic>=2.10.0"
+    - "python-dotenv>=1.0.1"
+    - "pyyaml>=6.0.2"
+    - "sqlalchemy>=2.0.0"
+    - "aiosqlite>=0.20.0"
+    - "asyncpg>=0.30.0"
+    - "pyjwt>=2.10.0"
+    - "redis>=5.0.0"
+    # 3. Testing, Linting & Type-Checking (matches `agents-cli lint` & `pytest`)
+    - "pytest>=9.0.0"
+    - "pytest-asyncio>=1.0.0"
+    - "ruff>=0.9.0"
+    - "ty>=0.0.1a0"
+    - "codespell>=2.2.0"
+
+  # Pre-installed globally (`npm install -g`) so harnesses and stdio MCP servers start in 0ms
+  npm_packages:
+    - "@anthropic-ai/claude-code@latest"
+    - "@google/antigravity@latest"
+    - "@modelcontextprotocol/server-slack"
+    - "@modelcontextprotocol/server-github"
+    - "@modelcontextprotocol/server-filesystem"
+
+  # System CLI binaries verified/installed in the sandbox for codebase search & GitHub PR workflows
+  system_binaries:
+    - "git"
+    - "gh"
+    - "rg"
+    - "jq"
+    - "curl"
+
+  shared_context_rules: |
+    # Shared Sandbox Engineering Rules (Synchronized to AGENTS.md, CLAUDE.md, and GEMINI.md)
+    - This workspace is shared across Claude Code (`claude`), Antigravity (`agy`), and ADK Long Horizon (`horizon`).
+    - Pre-installed SDKs & CLIs available in this sandbox: `google-adk` (`adk`), `google-genai`, `google-agents-cli` (`agents-cli`), `a2a-sdk`, `mcp`, `pytest`, `ruff`, `ty`, `gh`, `rg`, and `jq`.
+    - Always preserve existing git worktree branches (`agent/<task_id>`) and uncommitted modifications left by prior harness turns.
+    - Keep changes modular, run `pytest` and `ruff check` when tests are present, and leave a concise summary of modified files.
+
+repositories:
+  - name: "agents-cli"
+    git_url: "https://github.com/google/agents-cli.git"
+    branch: "main"
+    description: "Google Cloud Agents CLI toolkit for scaffolding, evaluating, and deploying ADK agents."
+
+  - name: "adk-samples"
+    git_url: "https://github.com/google/adk-samples.git"
+    branch: "main"
+    sparse_paths:
+      - "core/python/long-horizon-harness"
+    description: "Canonical ADK reference recipes including the long-horizon harness."
+
+seed_repositories:
+  - name: "auth-svc"
+    branch: "main"
+    description: "JWT authentication and Redis token rotation microservice."
+    files:
+      README.md: |
+        # auth-svc
+        Authentication microservice managing JWT issuance, refresh rotation, and JWKS endpoints.
+      src/auth/jwt.py: |
+        from datetime import datetime, timedelta, timezone
+        import jwt
+
+        def issue_access_token(user_id: str, secret: str) -> str:
+            payload = {
+                "sub": user_id,
+                "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+            }
+            return jwt.encode(payload, secret, algorithm="HS256")
+      src/cache/redis_store.py: |
+        class RedisTokenStore:
+            """Token store for rotating JWT refresh tokens with TTL."""
+
+            def allocate_jti(self, user_id: str, ttl: int = 900) -> str:
+                return f"jti-{user_id}-{ttl}"
+
+            def sign_with_active_key(self, payload: dict) -> str:
+                return f"signed:{payload.get('jti', 'default')}"
+      tests/test_jwt.py: |
+        from src.cache.redis_store import RedisTokenStore
+
+        def test_allocate_jti():
+            store = RedisTokenStore()
+            assert store.allocate_jti("u1", 900) == "jti-u1-900"
+    pending_patch: |
+      @@ -1,14 +1,22 @@ src/auth/jwt.py
+       from datetime import datetime, timedelta, timezone
+       import jwt
+      +from app.cache.redis_store import RedisTokenStore
+       
+      -def issue_access_token(user_id: str, secret: str) -> str:
+      -    payload = {
+      -        "sub": user_id,
+      -        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+      -    }
+      -    return jwt.encode(payload, secret, algorithm="HS256")
+      +def issue_rotating_token(
+      +    user_id: str,
+      +    store: RedisTokenStore,
+      +    ttl_seconds: int = 900,
+      +) -> dict[str, str]:
+      +    jti = store.allocate_jti(user_id=user_id, ttl=ttl_seconds)
+      +    payload = {
+      +        "sub": user_id,
+      +        "jti": jti,
+      +        "exp": datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+      +    }
+      +    token = store.sign_with_active_key(payload)
+      +    return {"access_token": token, "jti": jti}
+
+  - name: "analytics-svc"
+    branch: "main"
+    description: "BigQuery event streaming and telemetry batching service."
+    files:
+      README.md: |
+        # analytics-svc
+        Event ingestion and BigQuery streaming pipeline service.
+      src/pipeline/batcher.py: |
+        def flush_telemetry_batch(events: list[dict], max_batch_size: int = 500) -> int:
+            """Flushes buffered telemetry rows to BigQuery."""
+            return min(len(events), max_batch_size)
+      tests/test_batcher.py: |
+        from src.pipeline.batcher import flush_telemetry_batch
+
+        def test_flush_telemetry_batch():
+            assert flush_telemetry_batch([{"id": 1}, {"id": 2}]) == 2
+
+demo_tasks:
+  - goal: "Upgrade JWT refresh token rotation in auth-svc"
+    repo: "auth-svc"
+    harness: "claude"
+    mode: "plan"
+    summary: "Planned JWT refresh token upgrade for auth-svc. Ready for your approval."
+    response_text: "I inspected auth-svc and drafted the JWT rotation plan. Which token storage strategy should we execute?"
+    files_changed:
+      - "src/auth/jwt.py"
+      - "src/cache/redis_store.py"
+    questions:
+      - "Rotate JWT via Redis TTL (Recommended)"
+      - "Stateless JWKS endpoint with 15m grace window"
+  - goal: "Optimize BigQuery telemetry batching latency in analytics-svc"
+    repo: "analytics-svc"
+    harness: "horizon"
+    mode: "execute"
+    summary: "Optimized BigQuery telemetry batching latency by 38% in analytics-svc."
+    files_changed:
+      - "src/pipeline/batcher.py"
+      - "tests/test_batcher.py"
+    steps:
+      - "Inspecting analytics-svc event pipeline modules..."
+      - "Synthesizing BigQuery batching optimization..."
+      - "Running pytest suite across 14 event pipeline modules..."

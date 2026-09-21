@@ -1,0 +1,162 @@
+metrics_to_run:
+  - custom_response_quality
+  - spoken_voice_compliance
+  - expected_tool_called
+  - async_tool_acknowledgment
+
+custom_metrics:
+  # Default: local LLM-as-judge (see response_quality.py). Runs in-process via
+  # google-genai on Agent Platform (ADC) or Google AI Studio (GEMINI_API_KEY).
+  - name: custom_response_quality
+    custom_function_file: response_quality.py
+
+  # Verifies that when an asynchronous non-blocking tool (dispatch_task, steer_task,
+  # approve_task, search_web_grounded, search_maps_grounded) is called, the voice agent
+  # speaks an immediate acknowledgment in that turn so the user never experiences dead air.
+  - name: async_tool_acknowledgment
+    custom_function: |
+      def evaluate(instance):
+          async_tools = {
+              "dispatch_task",
+              "steer_task",
+              "approve_task",
+              "search_web_grounded",
+              "search_maps_grounded",
+          }
+          agent_data = instance.get("agent_data") or {}
+          turns = agent_data.get("turns") or []
+
+          has_async_call = False
+          acked_in_turn = False
+
+          for turn in turns:
+              turn_has_async_call = False
+              turn_spoken_texts = []
+              for ev in (turn.get("events") or []):
+                  author = ev.get("author") or ""
+                  if author in ("user", "tool"):
+                      continue
+                  content = ev.get("content") or {}
+                  parts = content.get("parts") or []
+                  for p in parts:
+                      if not isinstance(p, dict):
+                          continue
+                      if (p.get("text") or "").strip():
+                          turn_spoken_texts.append(p["text"].strip())
+                      if isinstance(p.get("function_call"), dict):
+                          fn_name = p["function_call"].get("name", "")
+                          if fn_name in async_tools:
+                              has_async_call = True
+                              turn_has_async_call = True
+              if turn_has_async_call and turn_spoken_texts:
+                  acked_in_turn = True
+
+          if not has_async_call:
+              return {"score": 1.0, "explanation": "Synchronous tool case (no async pre-acknowledgment required)"}
+
+          score = 1.0 if acked_in_turn else 0.0
+          return {
+              "score": score,
+              "explanation": "Spoke immediate non-blocking acknowledgment in the same turn as async tool call" if score == 1.0 else "Missing spoken acknowledgment on async tool turn (dead air)",
+          }
+
+  # Verifies that the voice agent adheres strictly to spoken voice formatting rules
+  # AND audio compression rules across all turns (never reading raw diff syntax,
+  # markdown, or raw stack trace frames aloud).
+  - name: spoken_voice_compliance
+    custom_function: |
+      def evaluate(instance):
+          agent_data = instance.get("agent_data") or {}
+          turns = agent_data.get("turns") or []
+
+          all_model_texts = []
+          for turn in turns:
+              for ev in (turn.get("events") or []):
+                  if ev.get("author") and ev.get("author") not in ("user", "tool"):
+                      content = ev.get("content") or {}
+                      for part in (content.get("parts") or []):
+                          if isinstance(part, dict) and part.get("text"):
+                              all_model_texts.append(part["text"])
+
+          if not all_model_texts:
+              resp_obj = instance.get("response") or {}
+              if isinstance(resp_obj, dict):
+                  parts = resp_obj.get("parts") or []
+                  all_model_texts.append(" ".join(p.get("text", "") for p in parts if isinstance(p, dict)))
+              elif isinstance(resp_obj, str):
+                  all_model_texts.append(resp_obj)
+
+          text = " ".join(all_model_texts)
+          violations = []
+          if "**" in text or "```" in text or "`" in text:
+              violations.append("contains markdown bold, backticks, or code fences")
+          if "http://" in text or "https://" in text:
+              violations.append("contains raw URL")
+          if "\n- " in text or "\n* " in text:
+              violations.append("contains markdown bullet list")
+          if "@@ -" in text or "diff --git" in text or "+++ b/" in text:
+              violations.append("read raw unified diff syntax aloud instead of compressing")
+          if "Traceback (most recent call last)" in text or "site-packages/" in text:
+              violations.append("read raw stack trace aloud instead of compressing")
+
+          score = 1.0 if (text.strip() and not violations) else 0.0
+          explanation = "Clean compressed spoken output across all turns" if score == 1.0 else f"Violations: {', '.join(violations) or 'empty response'}"
+          return {"score": score, "explanation": explanation}
+
+  # Verifies that the agent invoked the complete sequence of tools across single-turn and
+  # multi-turn CUJ trajectories (dispatch_task -> get_task_result -> steer_task / approve_task).
+  - name: expected_tool_called
+    custom_function: |
+      def evaluate(instance):
+          case_id = instance.get("eval_case_id", "")
+          agent_data = instance.get("agent_data") or {}
+          turns = agent_data.get("turns") or []
+
+          called_tools = []
+          for turn in turns:
+              for ev in (turn.get("events") or []):
+                  content = ev.get("content") or {}
+                  for part in (content.get("parts") or []):
+                      fc = part.get("function_call")
+                      if isinstance(fc, dict) and fc.get("name"):
+                          called_tools.append(fc["name"])
+
+          required_all_map = {
+              "cuj1_and_cuj2_plan_question_and_steer": ["dispatch_task", "get_task_result", "steer_task"],
+              "cuj3_diff_gate_and_voice_approve": ["dispatch_task", "get_task_result", "approve_task"],
+          }
+          if case_id in required_all_map:
+              required = required_all_map[case_id]
+              missing = [t for t in required if t not in called_tools]
+              score = 1.0 if not missing else 0.0
+              return {
+                  "score": score,
+                  "explanation": f"Called full trajectory tools: {called_tools}" if score == 1.0 else f"Missing {missing}; called {called_tools}",
+              }
+
+          expected_any_map = {
+              "discover_repositories": ["list_repositories", "inspect_repository_files"],
+              "list_coding_harnesses": ["list_harnesses"],
+              "route_spotify_music": ["spotify_playback", "spotify_"],
+              "route_google_search_realtime": ["search_web_grounded", "google_search"],
+              "route_google_maps_places": ["search_maps_grounded", "google_maps"],
+              "route_calendar_schedule": ["calendar_events", "calendar_"],
+              "route_gmail_inbox": ["gmail_messages", "gmail_"],
+              "route_drive_docs": ["drive_files", "drive_"],
+              "route_slack_channel": ["slack_messages", "slack_"],
+              "route_github_pr_status": ["github_operations", "github_"],
+              "route_coding_harness_dispatch": ["dispatch_task"],
+          }
+          expected_tools = expected_any_map.get(case_id, [])
+          if not expected_tools:
+              return {"score": 1.0, "explanation": "No specific tool assertion for case"}
+
+          matched = [
+              c for c in called_tools
+              if any(c == exp or (exp.endswith("_") and c.startswith(exp)) for exp in expected_tools)
+          ]
+          score = 1.0 if matched else 0.0
+          return {
+              "score": score,
+              "explanation": f"Routed correctly via {matched} (all called: {called_tools})" if matched else f"Expected one of {expected_tools}, called {called_tools}",
+          }

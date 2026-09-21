@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/brandicons.tsx","./src/components/a2ui/a2uisurfacedeck.tsx","./src/components/sheets/connectionssheet.tsx","./src/components/sheets/fleettaskssheet.tsx","./src/components/stage/geminiauroracanvas.tsx","./src/lib/api.ts","./src/lib/live-audio-client.ts"],"version":"5.9.3"}
