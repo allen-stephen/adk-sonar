@@ -1,19 +1,15 @@
-import asyncio
-import json
 import logging
 import os
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 import requests
 from requests.exceptions import RequestException
-from websockets.asyncio.client import connect
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

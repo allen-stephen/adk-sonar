@@ -6,9 +6,18 @@
 workspace_root: "./workspaces"
 
 sandbox:
+  # Where packages get installed inside the sandbox container. Both are
+  # auto-detected per container (an existing $VIRTUAL_ENV is reused, and the
+  # npm prefix is only overridden when the container's own prefix is
+  # read-only), so set these only to pin a custom or prebuilt image layout.
+  # Env vars SANDBOX_VENV_PATH / SANDBOX_NPM_PREFIX take precedence.
+  # venv_path: "/workspace/.sonar-venv"
+  # npm_prefix: "$HOME/.local"
+
   # Installed globally as CLI tools via `uv tool install`
   uv_tools:
     - "google-agents-cli"
+
 
   # Pre-installed into the shared sandbox Python environment (`uv pip install`)
   python_packages:
@@ -43,7 +52,6 @@ sandbox:
   # Pre-installed globally (`npm install -g`) so harnesses and stdio MCP servers start in 0ms
   npm_packages:
     - "@anthropic-ai/claude-code@latest"
-    - "@google/antigravity@latest"
     - "@modelcontextprotocol/server-slack"
     - "@modelcontextprotocol/server-github"
     - "@modelcontextprotocol/server-filesystem"

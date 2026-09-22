@@ -1,17 +1,19 @@
 """Downstream integration tools for the Live Voice Orchestrator (Spotify, Calendar, Gmail, Drive, Slack, GitHub).
 
-Each tool checks `IntegrationRegistry` state at runtime, executes against live APIs when credentials
-are present, and provides realistic structured execution receipts in local sandbox / evaluation mode
-so the voice routing layer can be deterministically evaluated and hill-climbed via `agents-cli eval run`.
+Each tool checks `IntegrationRegistry` state at runtime and executes against live REST APIs
+using the active credentials configured in `IntegrationAuthManager`.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import base64
 import os
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.app_utils.http_client import get_http_client
+from app.auth import ensure_fresh_access_token, get_workspace_headers
 from app.integrations import get_integration_registry
 
 AVAILABLE_VOICES = [
@@ -124,142 +126,125 @@ async def spotify_playback(
         return disabled_msg
 
     act = action.strip().lower()
-    target = query.strip() or "Deep Focus Coding playlist"
+    token = await ensure_fresh_access_token("spotify")
+    if not token:
+        return (
+            "Spotify is not authenticated yet. "
+            "Connect your Spotify account in the Configuration sheet or run make onboard to control playback."
+        )
 
-    # Attempt live Spotify Web API call if a real user token or refresh token is present
-    if not os.getenv("PYTEST_CURRENT_TEST"):
-        from app.auth import ensure_fresh_access_token
-        import httpx
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with get_http_client(timeout=6.0) as client:
+            if act == "now_playing":
+                r = await client.get(
+                    "https://api.spotify.com/v1/me/player/currently-playing",
+                    headers=headers,
+                )
+                if r.status_code == 204 or not r.content:
+                    return "Connected to your Spotify account, but nothing is currently playing right now."
+                if r.status_code == 200:
+                    data = r.json()
+                    item = data.get("item") or {}
+                    track_name = item.get("name")
+                    artists = ", ".join(
+                        a.get("name", "") for a in (item.get("artists") or [])
+                    )
+                    is_playing = data.get("is_playing", False)
+                    if track_name:
+                        state_word = "Currently playing" if is_playing else "Paused on"
+                        return f"{state_word} {track_name} by {artists} on Spotify."
+                    return "Connected to Spotify, but no active track is loaded."
+                return f"Spotify API error ({r.status_code}): {r.text.strip()}"
 
-        token = await ensure_fresh_access_token("spotify")
-        if token and not token.startswith("test-"):
-            headers = {"Authorization": f"Bearer {token}"}
-            try:
-                async with httpx.AsyncClient(timeout=6.0) as client:
-                    if act == "now_playing":
-                        r = await client.get(
-                            "https://api.spotify.com/v1/me/player/currently-playing",
-                            headers=headers,
-                        )
-                        if r.status_code == 204 or not r.content:
-                            return "Connected to your Spotify account, but nothing is currently playing right now."
-                        if r.status_code == 200:
-                            data = r.json()
-                            item = data.get("item") or {}
-                            track_name = item.get("name")
-                            artists = ", ".join(
-                                a.get("name", "") for a in (item.get("artists") or [])
-                            )
-                            is_playing = data.get("is_playing", False)
-                            if track_name:
-                                state_word = "Currently playing" if is_playing else "Paused on"
-                                return f"{state_word} {track_name} by {artists} on Spotify."
-                            return "Connected to Spotify, but no active track is loaded."
-                        return f"Spotify API error ({r.status_code}): {r.text.strip()}"
+            if act in {"pause", "stop"}:
+                r = await client.put(
+                    "https://api.spotify.com/v1/me/player/pause",
+                    headers=headers,
+                )
+                if r.status_code in {200, 204}:
+                    return "Paused Spotify playback on your active device."
+                return f"Spotify could not pause playback ({r.status_code}): {r.text.strip()}"
 
-                    if act in {"pause", "stop"}:
-                        r = await client.put(
-                            "https://api.spotify.com/v1/me/player/pause",
-                            headers=headers,
-                        )
-                        if r.status_code in {200, 204}:
-                            return "Paused Spotify playback on your active device."
-                        return f"Spotify could not pause playback ({r.status_code}): {r.text.strip()}"
+            if act in {"skip", "next"}:
+                r = await client.post(
+                    "https://api.spotify.com/v1/me/player/next",
+                    headers=headers,
+                )
+                if r.status_code in {200, 204}:
+                    return "Skipped to the next track on your Spotify device."
+                return f"Spotify could not skip track ({r.status_code}): {r.text.strip()}"
 
-                    if act in {"skip", "next"}:
-                        r = await client.post(
-                            "https://api.spotify.com/v1/me/player/next",
-                            headers=headers,
-                        )
-                        if r.status_code in {200, 204}:
-                            return "Skipped to the next track on your Spotify device."
-                        return f"Spotify could not skip track ({r.status_code}): {r.text.strip()}"
+            if act == "previous":
+                r = await client.post(
+                    "https://api.spotify.com/v1/me/player/previous",
+                    headers=headers,
+                )
+                if r.status_code in {200, 204}:
+                    return "Returned to the previous track on Spotify."
+                return f"Spotify could not go to previous track ({r.status_code}): {r.text.strip()}"
 
-                    if act == "previous":
-                        r = await client.post(
-                            "https://api.spotify.com/v1/me/player/previous",
-                            headers=headers,
-                        )
-                        if r.status_code in {200, 204}:
-                            return "Returned to the previous track on Spotify."
-                        return f"Spotify could not go to previous track ({r.status_code}): {r.text.strip()}"
+            if act in {"play", "resume", "queue"}:
+                if not query.strip():
+                    pr = await client.put(
+                        "https://api.spotify.com/v1/me/player/play",
+                        headers=headers,
+                    )
+                    if pr.status_code in {200, 204}:
+                        return "Resumed playback on your active Spotify device."
+                    return f"Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
 
-                    if act in {"play", "resume", "queue"}:
-                        if not query.strip():
-                            pr = await client.put(
-                                "https://api.spotify.com/v1/me/player/play",
-                                headers=headers,
-                            )
-                            if pr.status_code in {200, 204}:
-                                return "Resumed playback on your active Spotify device."
-                            return f"Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
+                sr = await client.get(
+                    "https://api.spotify.com/v1/search",
+                    params={"q": query.strip(), "type": "track,playlist", "limit": 1},
+                    headers=headers,
+                )
+                if sr.status_code != 200:
+                    return f"Spotify search failed ({sr.status_code}): {sr.text.strip()}"
 
-                        sr = await client.get(
-                            "https://api.spotify.com/v1/search",
-                            params={"q": query.strip(), "type": "track,playlist", "limit": 1},
-                            headers=headers,
-                        )
-                        if sr.status_code != 200:
-                            return f"Spotify search failed ({sr.status_code}): {sr.text.strip()}"
-
-                        sdata = sr.json()
-                        tracks = (sdata.get("tracks") or {}).get("items") or []
-                        playlists = (sdata.get("playlists") or {}).get("items") or []
-                        if act == "queue" and tracks:
-                            uri = tracks[0]["uri"]
-                            tname = tracks[0]["name"]
-                            qr = await client.post(
-                                "https://api.spotify.com/v1/me/player/queue",
-                                params={"uri": uri},
-                                headers=headers,
-                            )
-                            if qr.status_code in {200, 204}:
-                                return f"Added {tname} to your Spotify playback queue."
-                            return f"Spotify queue failed ({qr.status_code}): {qr.text.strip()}"
-                        if tracks:
-                            uri = tracks[0]["uri"]
-                            tname = tracks[0]["name"]
-                            artists = ", ".join(
-                                a.get("name", "") for a in (tracks[0].get("artists") or [])
-                            )
-                            pr = await client.put(
-                                "https://api.spotify.com/v1/me/player/play",
-                                json={"uris": [uri]},
-                                headers=headers,
-                            )
-                            if pr.status_code in {200, 204}:
-                                return f"Now playing {tname} by {artists} on Spotify."
-                            return f"Found {tname} by {artists}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
-                        if playlists:
-                            uri = playlists[0]["uri"]
-                            pname = playlists[0]["name"]
-                            pr = await client.put(
-                                "https://api.spotify.com/v1/me/player/play",
-                                json={"context_uri": uri},
-                                headers=headers,
-                            )
-                            if pr.status_code in {200, 204}:
-                                return f"Now playing playlist {pname} on Spotify."
-                            return f"Found playlist {pname}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
-                        return f"No matching tracks or playlists found on Spotify for {query.strip()}."
-            except Exception as exc:
-                return f"Error communicating with Spotify API: {exc}"
-
-    if act in {"pause", "stop"}:
-        return "Paused Spotify playback on your active device."
-    if act == "skip" or act == "next":
-        return "Skipped to the next track on Spotify: Horizon Line by Tycho."
-    if act == "previous":
-        return "Returned to the previous track on Spotify."
-    if act == "now_playing":
-        return "Currently playing Awake by Tycho from your Deep Focus Coding playlist on Spotify."
-    if act == "queue":
-        return f"Added {target} to your Spotify playback queue."
-    return f"Now playing {target} on Spotify."
-
-
-def _is_test_or_eval_mode() -> bool:
-    return bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("ADK_EVAL_MODE"))
+                sdata = sr.json()
+                tracks = (sdata.get("tracks") or {}).get("items") or []
+                playlists = (sdata.get("playlists") or {}).get("items") or []
+                if act == "queue" and tracks:
+                    uri = tracks[0]["uri"]
+                    tname = tracks[0]["name"]
+                    qr = await client.post(
+                        "https://api.spotify.com/v1/me/player/queue",
+                        params={"uri": uri},
+                        headers=headers,
+                    )
+                    if qr.status_code in {200, 204}:
+                        return f"Added {tname} to your Spotify playback queue."
+                    return f"Spotify queue failed ({qr.status_code}): {qr.text.strip()}"
+                if tracks:
+                    uri = tracks[0]["uri"]
+                    tname = tracks[0]["name"]
+                    artists = ", ".join(
+                        a.get("name", "") for a in (tracks[0].get("artists") or [])
+                    )
+                    pr = await client.put(
+                        "https://api.spotify.com/v1/me/player/play",
+                        json={"uris": [uri]},
+                        headers=headers,
+                    )
+                    if pr.status_code in {200, 204}:
+                        return f"Now playing {tname} by {artists} on Spotify."
+                    return f"Found {tname} by {artists}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
+                if playlists:
+                    uri = playlists[0]["uri"]
+                    pname = playlists[0]["name"]
+                    pr = await client.put(
+                        "https://api.spotify.com/v1/me/player/play",
+                        json={"context_uri": uri},
+                        headers=headers,
+                    )
+                    if pr.status_code in {200, 204}:
+                        return f"Now playing playlist {pname} on Spotify."
+                    return f"Found playlist {pname}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
+                return f"No matching tracks or playlists found on Spotify for {query.strip()}."
+            return f"Unsupported Spotify action '{action}'."
+    except Exception as exc:
+        return f"Error communicating with Spotify API: {exc}"
 
 
 async def calendar_events(
@@ -284,91 +269,93 @@ async def calendar_events(
     if disabled_msg:
         return disabled_msg
 
+    token = await ensure_fresh_access_token("google_workspace")
+    if not token:
+        return (
+            "Google Workspace is not authenticated yet. "
+            "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Google Calendar."
+        )
+
     act = action.strip().lower()
-    if not _is_test_or_eval_mode():
-        from datetime import datetime, timezone
-        import httpx
-        from app.auth import ensure_fresh_access_token
+    prefs = get_runtime_preferences()
+    user_tz = ZoneInfo(prefs["timezone"])
+    headers = get_workspace_headers(token)
+    now_iso = datetime.now(UTC).isoformat()
 
-        token = await ensure_fresh_access_token("google_workspace")
-        if not token or token.startswith("test-") or token.startswith("ya29.workspace-live"):
-            return (
-                "Google Workspace is not authenticated yet. "
-                "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Google Calendar."
-            )
-        from app.auth import get_workspace_headers
-
-        prefs = get_runtime_preferences()
-        user_tz = ZoneInfo(prefs["timezone"])
-        headers = get_workspace_headers(token)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                params: dict[str, str | int] = {
-                    "timeMin": now_iso,
-                    "timeZone": prefs["timezone"],
-                    "maxResults": 5,
-                    "singleEvents": "true",
-                    "orderBy": "startTime",
-                }
-                if query.strip():
-                    params["q"] = query.strip()
-                r = await client.get(
-                    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-                    params=params,
+    try:
+        async with get_http_client(timeout=8.0) as client:
+            if act == "create":
+                title = query.strip() or "Meeting"
+                r = await client.post(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events/quickAdd",
+                    params={"text": f"{title} {time_window}".strip()},
                     headers=headers,
                 )
-                if r.status_code == 200:
-                    items = r.json().get("items") or []
-                    if not items:
-                        return f"You have no upcoming events on your Google Calendar for {time_window} ({prefs['timezone']})."
-                    summaries = []
-                    bullets = []
-                    for ev in items[:4]:
-                        title = ev.get("summary") or "Untitled event"
-                        raw_dt = (ev.get("start") or {}).get("dateTime")
-                        raw_date = (ev.get("start") or {}).get("date")
-                        start_str = raw_dt or raw_date or ""
-                        if raw_dt:
-                            try:
-                                dt_obj = datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).astimezone(user_tz)
-                                start_str = dt_obj.strftime(f"%a %b %-d at %-I:%M %p {prefs['tz_abbrev']}")
-                            except Exception:
-                                pass
-                        summaries.append(f"{title} ({start_str})")
-                        bullets.append(f"{title} · {start_str}")
-                    try:
-                        from app.api_routes import record_context_surface
-
-                        record_context_surface(
-                            kind="google_calendar",
-                            title=f"Google Calendar · {prefs['tz_abbrev']}",
-                            subtitle=f"{len(items)} upcoming events ({prefs['timezone']})",
-                            brand_icon="google_calendar",
-                            badge=prefs["tz_abbrev"],
-                            bullets=bullets,
-                        )
-                    except Exception:
-                        pass
-                    return f"Upcoming on your Google Calendar ({prefs['timezone']}): {'; '.join(summaries)}."
+                if r.status_code in {200, 201}:
+                    created_summary = (r.json() or {}).get("summary") or title
+                    return f"Scheduled {created_summary} on your Google Calendar for {time_window}."
                 if r.status_code in {401, 403}:
                     return (
                         "Your Google token does not have Google Calendar permission yet. "
                         "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
                     )
                 return f"Google Calendar API returned {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            return f"Error querying Google Calendar API: {exc}"
 
-    if act == "create":
-        title = query.strip() or "Architecture Sync"
-        return f"Scheduled {title} on your Google Calendar for {time_window}."
-    if act == "check_availability":
-        return f"You have open blocks from 1:30 PM to 3:00 PM and after 4:00 PM {time_window} on Google Calendar."
-    return (
-        f"On your Google Calendar for {time_window}: Architecture Review at 11:00 AM, "
-        "Sprint Triage at 2:00 PM, and a clear focus block after 3:00 PM."
-    )
+            params: dict[str, str | int] = {
+                "timeMin": now_iso,
+                "timeZone": prefs["timezone"],
+                "maxResults": 5,
+                "singleEvents": "true",
+                "orderBy": "startTime",
+            }
+            if query.strip() and act != "check_availability":
+                params["q"] = query.strip()
+            r = await client.get(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                params=params,
+                headers=headers,
+            )
+            if r.status_code == 200:
+                items = r.json().get("items") or []
+                if not items:
+                    return f"You have no upcoming events on your Google Calendar for {time_window} ({prefs['timezone']})."
+                summaries = []
+                bullets = []
+                for ev in items[:4]:
+                    title = ev.get("summary") or "Untitled event"
+                    raw_dt = (ev.get("start") or {}).get("dateTime")
+                    raw_date = (ev.get("start") or {}).get("date")
+                    start_str = raw_dt or raw_date or ""
+                    if raw_dt:
+                        try:
+                            dt_obj = datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).astimezone(user_tz)
+                            start_str = dt_obj.strftime(f"%a %b %-d at %-I:%M %p {prefs['tz_abbrev']}")
+                        except Exception:
+                            pass
+                    summaries.append(f"{title} ({start_str})")
+                    bullets.append(f"{title} · {start_str}")
+                try:
+                    from app.api_routes import record_context_surface
+
+                    record_context_surface(
+                        kind="google_calendar",
+                        title=f"Google Calendar · {prefs['tz_abbrev']}",
+                        subtitle=f"{len(items)} upcoming events ({prefs['timezone']})",
+                        brand_icon="google_calendar",
+                        badge=prefs["tz_abbrev"],
+                        bullets=bullets,
+                    )
+                except Exception:
+                    pass
+                return f"Upcoming on your Google Calendar ({prefs['timezone']}): {'; '.join(summaries)}."
+            if r.status_code in {401, 403}:
+                return (
+                    "Your Google token does not have Google Calendar permission yet. "
+                    "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
+                )
+            return f"Google Calendar API returned {r.status_code}: {r.text[:200]}"
+    except Exception as exc:
+        return f"Error querying Google Calendar API: {exc}"
 
 
 async def gmail_messages(
@@ -393,77 +380,78 @@ async def gmail_messages(
     if disabled_msg:
         return disabled_msg
 
+    token = await ensure_fresh_access_token("google_workspace")
+    if not token:
+        return (
+            "Google Workspace is not authenticated yet. "
+            "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Gmail inbox."
+        )
+
     act = action.strip().lower()
-    if not _is_test_or_eval_mode():
-        import httpx
-        from app.auth import ensure_fresh_access_token
-
-        token = await ensure_fresh_access_token("google_workspace")
-        if not token or token.startswith("test-") or token.startswith("ya29.workspace-live"):
-            return (
-                "Google Workspace is not authenticated yet. "
-                "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Gmail inbox."
-            )
-        from app.auth import get_workspace_headers
-
-        headers = get_workspace_headers(token)
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.get(
-                    "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-                    params={"q": query or "is:unread", "maxResults": 4},
+    headers = get_workspace_headers(token)
+    try:
+        async with get_http_client(timeout=8.0) as client:
+            if act == "draft_reply":
+                to_str = recipient.strip() or "recipient@example.com"
+                subject_str = query.strip() or "Follow-up"
+                raw_mime = f"To: {to_str}\r\nSubject: {subject_str}\r\n\r\n{subject_str}"
+                encoded = base64.urlsafe_b64encode(raw_mime.encode("utf-8")).decode("ascii")
+                dr = await client.post(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+                    json={"message": {"raw": encoded}},
                     headers=headers,
                 )
-                if r.status_code == 200:
-                    msgs = r.json().get("messages") or []
-                    if not msgs:
-                        return f"No Gmail messages found matching '{query}'."
-                    snippets = []
-                    for m in msgs[:4]:
-                        mr = await client.get(
-                            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}",
-                            params={"format": "metadata", "metadataHeaders": ["Subject", "From"]},
-                            headers=headers,
-                        )
-                        if mr.status_code == 200:
-                            mdata = mr.json()
-                            hdrs = {
-                                h["name"]: h["value"]
-                                for h in (mdata.get("payload", {}).get("headers") or [])
-                            }
-                            snippets.append(
-                                f"{hdrs.get('Subject', 'No Subject')} from {hdrs.get('From', 'Unknown')}"
-                            )
-                    try:
-                        from app.api_routes import record_context_surface
+                if dr.status_code in {200, 201}:
+                    return f"Created a Gmail draft to {to_str} regarding {subject_str}."
+                return f"Gmail draft creation returned {dr.status_code}: {dr.text[:200]}"
 
-                        record_context_surface(
-                            kind="gmail",
-                            title=f"Gmail · {query or 'Inbox'}",
-                            subtitle=f"Top {len(snippets)} matching messages",
-                            brand_icon="gmail",
-                            badge="Gmail",
-                            bullets=snippets,
-                        )
-                    except Exception:
-                        pass
-                    return f"Found {len(snippets)} Gmail messages matching '{query}': {'; '.join(snippets)}."
-                if r.status_code in {401, 403}:
-                    return (
-                        "Your Google token does not have Gmail permission yet. "
-                        "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
+            r = await client.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                params={"q": query or "is:unread", "maxResults": 4},
+                headers=headers,
+            )
+            if r.status_code == 200:
+                msgs = r.json().get("messages") or []
+                if not msgs:
+                    return f"No Gmail messages found matching '{query}'."
+                snippets = []
+                for m in msgs[:4]:
+                    mr = await client.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}",
+                        params={"format": "metadata", "metadataHeaders": ["Subject", "From"]},
+                        headers=headers,
                     )
-                return f"Gmail API returned {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            return f"Error querying Gmail API: {exc}"
+                    if mr.status_code == 200:
+                        mdata = mr.json()
+                        hdrs = {
+                            h["name"]: h["value"]
+                            for h in (mdata.get("payload", {}).get("headers") or [])
+                        }
+                        snippets.append(
+                            f"{hdrs.get('Subject', 'No Subject')} from {hdrs.get('From', 'Unknown')}"
+                        )
+                try:
+                    from app.api_routes import record_context_surface
 
-    if act == "draft_reply":
-        to_str = recipient.strip() or "the engineering lead"
-        return f"Created a Gmail draft to {to_str} regarding {query or 'the release timeline'}."
-    return (
-        f"Found 2 priority Gmail threads matching '{query}': "
-        "Alex Chen sent an update on the auth service rollout, and Maya Patel shared the Q3 latency benchmarks."
-    )
+                    record_context_surface(
+                        kind="gmail",
+                        title=f"Gmail · {query or 'Inbox'}",
+                        subtitle=f"Top {len(snippets)} matching messages",
+                        brand_icon="gmail",
+                        badge="Gmail",
+                        bullets=snippets,
+                    )
+                except Exception:
+                    pass
+                return f"Found {len(snippets)} Gmail messages matching '{query}': {'; '.join(snippets)}."
+            if r.status_code in {401, 403}:
+                return (
+                    "Your Google token does not have Gmail permission yet. "
+                    "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
+                )
+            return f"Gmail API returned {r.status_code}: {r.text[:200]}"
+    except Exception as exc:
+        return f"Error querying Gmail API: {exc}"
 
 
 async def drive_files(
@@ -486,60 +474,65 @@ async def drive_files(
     if disabled_msg:
         return disabled_msg
 
-    if not _is_test_or_eval_mode():
-        import httpx
-        from app.auth import ensure_fresh_access_token
+    token = await ensure_fresh_access_token("google_workspace")
+    if not token:
+        return (
+            "Google Workspace is not authenticated yet. "
+            "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Google Drive."
+        )
 
-        token = await ensure_fresh_access_token("google_workspace")
-        if not token or token.startswith("test-") or token.startswith("ya29.workspace-live"):
-            return (
-                "Google Workspace is not authenticated yet. "
-                "Toggle Google Workspace on in the Configuration sheet or run make onboard to connect your Google Drive."
+    headers = get_workspace_headers(token)
+    try:
+        async with get_http_client(timeout=8.0) as client:
+            q_param = (
+                f"name contains '{query.strip()}' and trashed = false"
+                if query.strip()
+                else "trashed = false"
             )
-        from app.auth import get_workspace_headers
+            r = await client.get(
+                "https://www.googleapis.com/drive/v3/files",
+                params={
+                    "q": q_param,
+                    "pageSize": 5,
+                    "fields": "files(id,name,mimeType,modifiedTime,description)",
+                },
+                headers=headers,
+            )
+            if r.status_code == 200:
+                files = r.json().get("files") or []
+                if not files:
+                    return f"No Google Drive files found matching '{query}'."
+                names = [f["name"] for f in files[:5]]
+                descriptions = [
+                    str(f.get("description") or "").strip()
+                    for f in files[:2]
+                    if f.get("description")
+                ]
+                try:
+                    from app.api_routes import record_context_surface
 
-        headers = get_workspace_headers(token)
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                q_param = f"name contains '{query.strip()}' and trashed = false" if query.strip() else "trashed = false"
-                r = await client.get(
-                    "https://www.googleapis.com/drive/v3/files",
-                    params={"q": q_param, "pageSize": 5, "fields": "files(id,name,mimeType,modifiedTime)"},
-                    headers=headers,
-                )
-                if r.status_code == 200:
-                    files = r.json().get("files") or []
-                    if not files:
-                        return f"No Google Drive files found matching '{query}'."
-                    names = [f["name"] for f in files[:5]]
-                    try:
-                        from app.api_routes import record_context_surface
-
-                        record_context_surface(
-                            kind="google_drive",
-                            title=f"Google Drive · {query or 'Recent Files'}",
-                            subtitle=f"Found {len(names)} files in Google Drive",
-                            brand_icon="google_drive",
-                            badge="Drive",
-                            bullets=names,
-                        )
-                    except Exception:
-                        pass
-                    return f"Found Google Drive files: {', '.join(names)}."
-                if r.status_code in {401, 403}:
-                    return (
-                        "Your Google token does not have Google Drive permission yet. "
-                        "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
+                    record_context_surface(
+                        kind="google_drive",
+                        title=f"Google Drive · {query or 'Recent Files'}",
+                        subtitle=f"Found {len(names)} files in Google Drive",
+                        brand_icon="google_drive",
+                        badge="Drive",
+                        bullets=names,
                     )
-                return f"Google Drive API returned {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            return f"Error querying Google Drive API: {exc}"
-
-    topic = query.strip() or "Engineering Architecture Spec"
-    return (
-        f"Found Google Drive document '{topic}' updated two hours ago. "
-        "It specifies Redis-backed JWT rotation with a 15-minute grace window and zero-downtime key rollover."
-    )
+                except Exception:
+                    pass
+                summary = f"Found Google Drive files: {', '.join(names)}."
+                if descriptions:
+                    summary += f" {' '.join(descriptions)}"
+                return summary
+            if r.status_code in {401, 403}:
+                return (
+                    "Your Google token does not have Google Drive permission yet. "
+                    "Click Google Workspace in the Configuration sheet or run make onboard to grant Calendar, Gmail, and Drive scopes."
+                )
+            return f"Google Drive API returned {r.status_code}: {r.text[:200]}"
+    except Exception as exc:
+        return f"Error querying Google Drive API: {exc}"
 
 
 async def slack_messages(
@@ -565,60 +558,50 @@ async def slack_messages(
         return disabled_msg
 
     ch = channel.strip().lstrip("#") or "eng-alerts"
-    if not os.getenv("PYTEST_CURRENT_TEST"):
-        import httpx
+    token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        return "Slack is enabled, but SLACK_BOT_TOKEN is not configured yet. Connect Slack in the Configuration sheet."
 
-        token = os.getenv("SLACK_BOT_TOKEN", "").strip()
-        if not token:
-            return "Slack is enabled, but SLACK_BOT_TOKEN is not configured yet. Connect Slack in the Configuration sheet."
-        if not token.startswith("xoxb-test"):
-            headers = {"Authorization": f"Bearer {token}"}
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    cl = await client.get(
-                        "https://slack.com/api/conversations.list",
-                        params={"types": "public_channel,private_channel", "limit": 100},
-                        headers=headers,
-                    )
-                    cdata = cl.json()
-                    if not cdata.get("ok"):
-                        return f"Slack API error: {cdata.get('error', 'unknown error')}."
-                    channels = cdata.get("channels") or []
-                    target_ch = next((c for c in channels if c.get("name") == ch), None)
-                    if not target_ch and channels:
-                        target_ch = channels[0]
-                    if not target_ch:
-                        return f"Connected to Slack, but could not find channel {ch}."
-                    cid = target_ch["id"]
-                    cname = target_ch["name"]
-                    if action.strip().lower() == "post" and message.strip():
-                        pr = await client.post(
-                            "https://slack.com/api/chat.postMessage",
-                            json={"channel": cid, "text": message.strip()},
-                            headers=headers,
-                        )
-                        if pr.json().get("ok"):
-                            return f"Posted your message to the {cname} channel on Slack."
-                        return f"Failed to post to Slack channel {cname}: {pr.json().get('error')}."
-                    hr = await client.get(
-                        "https://slack.com/api/conversations.history",
-                        params={"channel": cid, "limit": 3},
-                        headers=headers,
-                    )
-                    hdata = hr.json()
-                    msgs = [m.get("text", "") for m in (hdata.get("messages") or []) if m.get("text")]
-                    if not msgs:
-                        return f"No recent messages in Slack channel {cname}."
-                    return f"Latest in Slack channel {cname}: {' | '.join(msgs[:2])}"
-            except Exception as exc:
-                return f"Error communicating with Slack API: {exc}"
-
-    if action.strip().lower() == "post":
-        return f"Posted your update to the {ch} channel on Slack."
-    return (
-        f"Latest in Slack channel {ch}: DevOps confirmed the staging canary passed all smoke checks "
-        "and is ready for production promotion."
-    )
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with get_http_client(timeout=8.0) as client:
+            cl = await client.get(
+                "https://slack.com/api/conversations.list",
+                params={"types": "public_channel,private_channel", "limit": 100},
+                headers=headers,
+            )
+            cdata = cl.json()
+            if not cdata.get("ok"):
+                return f"Slack API error: {cdata.get('error', 'unknown error')}."
+            channels = cdata.get("channels") or []
+            target_ch = next((c for c in channels if c.get("name") == ch), None)
+            if not target_ch and channels:
+                target_ch = channels[0]
+            if not target_ch:
+                return f"Connected to Slack, but could not find channel {ch}."
+            cid = target_ch["id"]
+            cname = target_ch["name"]
+            if action.strip().lower() == "post":
+                pr = await client.post(
+                    "https://slack.com/api/chat.postMessage",
+                    json={"channel": cid, "text": message.strip() or "Status update"},
+                    headers=headers,
+                )
+                if pr.json().get("ok"):
+                    return f"Posted your message to the {cname} channel on Slack."
+                return f"Failed to post to Slack channel {cname}: {pr.json().get('error')}."
+            hr = await client.get(
+                "https://slack.com/api/conversations.history",
+                params={"channel": cid, "limit": 3},
+                headers=headers,
+            )
+            hdata = hr.json()
+            msgs = [m.get("text", "") for m in (hdata.get("messages") or []) if m.get("text")]
+            if not msgs:
+                return f"No recent messages in Slack channel {cname}."
+            return f"Latest in Slack channel {cname}: {' | '.join(msgs[:2])}"
+    except Exception as exc:
+        return f"Error communicating with Slack API: {exc}"
 
 
 _cached_github_login: str | None = None
@@ -696,237 +679,233 @@ async def github_operations(
 
     act = action.strip().lower()
     target_repo = repo.strip() or "adk-python"
+    token = (
+        os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+        or os.getenv("GH_TOKEN", "").strip()
+    )
+    if not token:
+        return (
+            "GitHub is not authenticated yet. "
+            "Configure GITHUB_PERSONAL_ACCESS_TOKEN in the Configuration sheet or run make onboard to inspect pull requests and CI runs."
+        )
 
-    # Live GitHub REST API execution outside pytest
-    if not os.getenv("PYTEST_CURRENT_TEST"):
-        import httpx
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with get_http_client(timeout=10.0) as client:
+            gh_user = (
+                user.strip().lstrip("@")
+                or await _resolve_authenticated_github_user(client, headers)
+            )
+            short_repo, fork_slug, upstream_slug = (
+                _resolve_github_owner_and_repo(target_repo, gh_user)
+            )
 
-        token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
-        if token and not token.startswith("ghp_test"):
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    gh_user = (
-                        user.strip().lstrip("@")
-                        or await _resolve_authenticated_github_user(client, headers)
+            # 1. Inspect personal fork branches (`fork_status` or `branches`)
+            if act in {"fork_status", "branches", "inspect_fork"} and fork_slug:
+                r_br = await client.get(
+                    f"https://api.github.com/repos/{fork_slug}/branches",
+                    params={"per_page": 15},
+                    headers=headers,
+                )
+                if r_br.status_code == 200:
+                    branches = [
+                        b["name"]
+                        for b in (r_br.json() or [])
+                        if isinstance(b, dict) and b.get("name")
+                    ]
+                    feature_branches = [b for b in branches if b != "main"]
+                    bullets = [f"Branch: {b}" for b in (feature_branches or branches)[:6]]
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="github_fork",
+                            title=f"{fork_slug} · Personal Fork",
+                            subtitle=f"{len(feature_branches)} active feature branches on your fork",
+                            brand_icon="github",
+                            badge=fork_slug,
+                            bullets=bullets,
+                        )
+                    except Exception:
+                        pass
+                    top_br = ", ".join((feature_branches or branches)[:5])
+                    return (
+                        f"On your personal fork {fork_slug}, you have {len(feature_branches)} active feature branches "
+                        f"including {top_br}."
                     )
-                    short_repo, fork_slug, upstream_slug = (
-                        _resolve_github_owner_and_repo(target_repo, gh_user)
-                    )
 
-                    # 1. Inspect personal fork branches (`fork_status` or `branches`)
-                    if act in {"fork_status", "branches", "inspect_fork"} and fork_slug:
-                        r_br = await client.get(
-                            f"https://api.github.com/repos/{fork_slug}/branches",
-                            params={"per_page": 15},
-                            headers=headers,
-                        )
-                        if r_br.status_code == 200:
-                            branches = [
-                                b["name"]
-                                for b in (r_br.json() or [])
-                                if isinstance(b, dict) and b.get("name")
-                            ]
-                            feature_branches = [b for b in branches if b != "main"]
-                            bullets = [f"Branch: {b}" for b in (feature_branches or branches)[:6]]
-                            try:
-                                from app.api_routes import record_context_surface
-
-                                record_context_surface(
-                                    kind="github_fork",
-                                    title=f"{fork_slug} · Personal Fork",
-                                    subtitle=f"{len(feature_branches)} active feature branches on your fork",
-                                    brand_icon="github",
-                                    badge=fork_slug,
-                                    bullets=bullets,
-                                )
-                            except Exception:
-                                pass
-                            top_br = ", ".join((feature_branches or branches)[:5])
-                            return (
-                                f"On your personal fork {fork_slug}, you have {len(feature_branches)} active feature branches "
-                                f"including {top_br}."
-                            )
-
-                    # 2. CI status check (`ci_status`)
-                    if act == "ci_status":
-                        slugs = [s for s in (fork_slug, upstream_slug) if s]
-                        for slug in slugs:
-                            r = await client.get(
-                                f"https://api.github.com/repos/{slug}/actions/runs",
-                                params={"per_page": 3},
-                                headers=headers,
-                            )
-                            if r.status_code == 200:
-                                runs = r.json().get("workflow_runs") or []
-                                if not runs:
-                                    continue
-                                summaries = [
-                                    f"{w.get('name')}: {w.get('conclusion') or w.get('status')} on {w.get('head_branch')}"
-                                    for w in runs[:3]
-                                ]
-                                return f"Latest GitHub Actions runs on {slug}: {'; '.join(summaries)}."
-
-                    # 3. Issues (`list_issues`)
-                    if act == "list_issues":
-                        r = await client.get(
-                            f"https://api.github.com/repos/{upstream_slug}/issues",
-                            params={"state": "open", "per_page": 5},
-                            headers=headers,
-                        )
-                        if r.status_code == 200:
-                            items = [
-                                i for i in (r.json() or []) if "pull_request" not in i
-                            ]
-                            if items:
-                                spoken = "; ".join(
-                                    f"issue {i['number']}, {i['title']}"
-                                    for i in items[:3]
-                                )
-                                return f"Open GitHub issues on {upstream_slug}: {spoken}."
-
-                    # 4. Pull Requests (`list_prs` / `my_prs`):
-                    # Inspects (a) PRs authored by the authenticated user, (b) active feature branches on their fork, and (c) upstream PRs.
-                    if number > 0:
-                        for slug in [s for s in (upstream_slug, fork_slug) if s]:
-                            r = await client.get(
-                                f"https://api.github.com/repos/{slug}/pulls/{number}",
-                                headers=headers,
-                            )
-                            if r.status_code == 200:
-                                pr = r.json()
-                                return (
-                                    f"Pull request {pr['number']} on {slug} by {pr.get('user', {}).get('login')}: "
-                                    f"{pr['title']} (state: {pr['state']}, branch: {pr.get('head', {}).get('label')})."
-                                )
-
-                    my_prs: list[dict[str, Any]] = []
-                    if gh_user:
-                        q_user = f"is:pr author:{gh_user}"
-                        q_user_repo = (
-                            f"{q_user} repo:{upstream_slug}"
-                            if (short_repo and act != "my_prs")
-                            else q_user
-                        )
-                        r_my = await client.get(
-                            "https://api.github.com/search/issues",
-                            params={"q": q_user_repo, "per_page": 5},
-                            headers=headers,
-                        )
-                        my_prs = (
-                            (r_my.json().get("items") or [])
-                            if r_my.status_code == 200
-                            else []
-                        )
-                        if not my_prs and q_user_repo != q_user:
-                            r_my_all = await client.get(
-                                "https://api.github.com/search/issues",
-                                params={"q": q_user, "per_page": 5},
-                                headers=headers,
-                            )
-                            my_prs = (
-                                (r_my_all.json().get("items") or [])
-                                if r_my_all.status_code == 200
-                                else []
-                            )
-
-                    fork_branches: list[str] = []
-                    if fork_slug:
-                        r_fork_br = await client.get(
-                            f"https://api.github.com/repos/{fork_slug}/branches",
-                            params={"per_page": 10},
-                            headers=headers,
-                        )
-                        if r_fork_br.status_code == 200:
-                            fork_branches = [
-                                b["name"]
-                                for b in (r_fork_br.json() or [])
-                                if isinstance(b, dict) and b.get("name") != "main"
-                            ]
-
-                    r_up = await client.get(
-                        f"https://api.github.com/repos/{upstream_slug}/pulls",
-                        params={"state": "open", "per_page": 4},
+            # 2. CI status check (`ci_status`)
+            if act == "ci_status":
+                slugs = [s for s in (fork_slug, upstream_slug) if s]
+                for slug in slugs:
+                    r = await client.get(
+                        f"https://api.github.com/repos/{slug}/actions/runs",
+                        params={"per_page": 3},
                         headers=headers,
                     )
-                    up_prs = (r_up.json() or []) if r_up.status_code == 200 else []
+                    if r.status_code == 200:
+                        runs = r.json().get("workflow_runs") or []
+                        if not runs:
+                            continue
+                        summaries = [
+                            f"{w.get('name')}: {w.get('conclusion') or w.get('status')} on {w.get('head_branch')}"
+                            for w in runs[:3]
+                        ]
+                        return f"Latest GitHub Actions CI runs on {slug}: {'; '.join(summaries)}."
+                return f"No recent GitHub Actions CI runs found on {upstream_slug}."
 
-                    parts: list[str] = []
-                    bullets: list[str] = []
-
-                    if my_prs:
-                        open_mine = [p for p in my_prs if p.get("state") == "open"]
-                        closed_mine = [p for p in my_prs if p.get("state") != "open"]
-                        if open_mine:
-                            mine_str = "; ".join(
-                                f"PR {p['number']} on {p['repository_url'].split('/')[-1]} ({p['title']})"
-                                for p in open_mine[:3]
-                            )
-                            parts.append(f"Your open pull requests as {gh_user}: {mine_str}")
-                            for p in open_mine[:3]:
-                                bullets.append(
-                                    f"[Open · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
-                                )
-                        if closed_mine:
-                            recent_str = "; ".join(
-                                f"PR {p['number']} on {p['repository_url'].split('/')[-1]} ({p['title']}, {p['state']})"
-                                for p in closed_mine[:2]
-                            )
-                            parts.append(f"Your recent pull requests: {recent_str}")
-                            for p in closed_mine[:2]:
-                                bullets.append(
-                                    f"[Merged/Closed · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
-                                )
-
-                    if fork_branches and fork_slug:
-                        parts.append(
-                            f"Your personal fork {fork_slug} has {len(fork_branches)} active feature branches ({', '.join(fork_branches[:4])})"
+            # 3. Issues (`list_issues`)
+            if act == "list_issues":
+                r = await client.get(
+                    f"https://api.github.com/repos/{upstream_slug}/issues",
+                    params={"state": "open", "per_page": 5},
+                    headers=headers,
+                )
+                if r.status_code == 200:
+                    items = [
+                        i for i in (r.json() or []) if "pull_request" not in i
+                    ]
+                    if items:
+                        spoken = "; ".join(
+                            f"issue {i['number']}, {i['title']}"
+                            for i in items[:3]
                         )
+                        return f"Open GitHub issues on {upstream_slug}: {spoken}."
+                return f"No open GitHub issues found on {upstream_slug}."
+
+            # 4. Pull Requests (`list_prs` / `my_prs`):
+            if number > 0:
+                for slug in [s for s in (upstream_slug, fork_slug) if s]:
+                    r = await client.get(
+                        f"https://api.github.com/repos/{slug}/pulls/{number}",
+                        headers=headers,
+                    )
+                    if r.status_code == 200:
+                        pr = r.json()
+                        return (
+                            f"Pull request {pr['number']} on {slug} by {pr.get('user', {}).get('login')}: "
+                            f"{pr['title']} (state: {pr['state']}, branch: {pr.get('head', {}).get('label')})."
+                        )
+
+            my_prs: list[dict[str, Any]] = []
+            if gh_user:
+                q_user = f"is:pr author:{gh_user}"
+                q_user_repo = (
+                    f"{q_user} repo:{upstream_slug}"
+                    if (short_repo and act != "my_prs")
+                    else q_user
+                )
+                r_my = await client.get(
+                    "https://api.github.com/search/issues",
+                    params={"q": q_user_repo, "per_page": 5},
+                    headers=headers,
+                )
+                my_prs = (
+                    (r_my.json().get("items") or [])
+                    if r_my.status_code == 200
+                    else []
+                )
+                if not my_prs and q_user_repo != q_user:
+                    r_my_all = await client.get(
+                        "https://api.github.com/search/issues",
+                        params={"q": q_user, "per_page": 5},
+                        headers=headers,
+                    )
+                    my_prs = (
+                        (r_my_all.json().get("items") or [])
+                        if r_my_all.status_code == 200
+                        else []
+                    )
+
+            fork_branches: list[str] = []
+            if fork_slug:
+                r_fork_br = await client.get(
+                    f"https://api.github.com/repos/{fork_slug}/branches",
+                    params={"per_page": 10},
+                    headers=headers,
+                )
+                if r_fork_br.status_code == 200:
+                    fork_branches = [
+                        b["name"]
+                        for b in (r_fork_br.json() or [])
+                        if isinstance(b, dict) and b.get("name") != "main"
+                    ]
+
+            r_up = await client.get(
+                f"https://api.github.com/repos/{upstream_slug}/pulls",
+                params={"state": "open", "per_page": 4},
+                headers=headers,
+            )
+            up_prs = (r_up.json() or []) if r_up.status_code == 200 else []
+
+            parts: list[str] = []
+            bullets: list[str] = []
+
+            if my_prs:
+                open_mine = [p for p in my_prs if p.get("state") == "open"]
+                closed_mine = [p for p in my_prs if p.get("state") != "open"]
+                if open_mine:
+                    mine_str = "; ".join(
+                        f"PR {p['number']} on {p['repository_url'].split('/')[-1]} ({p['title']})"
+                        for p in open_mine[:3]
+                    )
+                    parts.append(f"Your open pull requests as {gh_user}: {mine_str}")
+                    for p in open_mine[:3]:
                         bullets.append(
-                            f"Fork {fork_slug} branches: {', '.join(fork_branches[:4])}"
+                            f"[Open · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
+                        )
+                if closed_mine:
+                    recent_str = "; ".join(
+                        f"PR {p['number']} on {p['repository_url'].split('/')[-1]} ({p['title']}, {p['state']})"
+                        for p in closed_mine[:2]
+                    )
+                    parts.append(f"Your recent pull requests: {recent_str}")
+                    for p in closed_mine[:2]:
+                        bullets.append(
+                            f"[Merged/Closed · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
                         )
 
-                    if up_prs and act != "my_prs":
-                        up_str = "; ".join(
-                            f"PR {p['number']} by {p.get('user', {}).get('login')} ({p['title']})"
-                            for p in up_prs[:2]
-                        )
-                        parts.append(f"Latest upstream open PRs on {upstream_slug}: {up_str}")
-                        for p in up_prs[:2]:
-                            bullets.append(
-                                f"[{upstream_slug}#{p['number']}] {p['title']} (@{p.get('user', {}).get('login')})"
-                            )
+            if fork_branches and fork_slug:
+                parts.append(
+                    f"Your personal fork {fork_slug} has {len(fork_branches)} active feature branches ({', '.join(fork_branches[:4])})"
+                )
+                bullets.append(
+                    f"Fork {fork_slug} branches: {', '.join(fork_branches[:4])}"
+                )
 
-                    if bullets:
-                        try:
-                            from app.api_routes import record_context_surface
+            if up_prs and act != "my_prs":
+                up_str = "; ".join(
+                    f"PR {p['number']} by {p.get('user', {}).get('login')} ({p['title']})"
+                    for p in up_prs[:2]
+                )
+                parts.append(f"Latest upstream open PRs on {upstream_slug}: {up_str}")
+                for p in up_prs[:2]:
+                    bullets.append(
+                        f"[{upstream_slug}#{p['number']}] {p['title']} (@{p.get('user', {}).get('login')})"
+                    )
 
-                            badge_label = fork_slug or upstream_slug
-                            record_context_surface(
-                                kind="github_prs",
-                                title=f"GitHub · {gh_user or 'Activity'} & {short_repo or 'Repos'}",
-                                subtitle=f"Personal fork ({badge_label}) & pull requests",
-                                brand_icon="github",
-                                badge=badge_label,
-                                bullets=bullets[:5],
-                            )
-                        except Exception:
-                            pass
+            if bullets:
+                try:
+                    from app.api_routes import record_context_surface
 
-                    if parts:
-                        return ". ".join(parts) + "."
-                    return f"Checked {fork_slug or upstream_slug}, and found no matching pull requests."
-            except Exception as exc:
-                return f"Error querying GitHub API for {target_repo}: {exc}"
+                    badge_label = fork_slug or upstream_slug
+                    record_context_surface(
+                        kind="github_prs",
+                        title=f"GitHub · {gh_user or 'Activity'} & {short_repo or 'Repos'}",
+                        subtitle=f"Personal fork ({badge_label}) & pull requests",
+                        brand_icon="github",
+                        badge=badge_label,
+                        bullets=bullets[:5],
+                    )
+                except Exception:
+                    pass
 
-    if act == "ci_status":
-        pr_ref = f"pull request {number}" if number else "the latest pull request"
-        return f"GitHub Actions CI checks on {target_repo} for {pr_ref} are all passing across 42 unit and integration tests."
-    if act == "list_issues":
-        return f"Open GitHub issues on {target_repo}: issue 42 covers Redis connection pool tuning, and issue 45 tracks OAuth token refresh."
-    return f"Open pull requests on {target_repo}: PR 18 adds Redis JWT rotation and is approved with all CI checks green."
-
+            if parts:
+                return ". ".join(parts) + "."
+            return f"Checked {fork_slug or upstream_slug}, and found no matching pull requests."
+    except Exception as exc:
+        return f"Error querying GitHub API for {target_repo}: {exc}"

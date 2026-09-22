@@ -5,9 +5,10 @@ from app.workers.harnesses.base import (
     CodingHarness,
     HarnessEvent,
     SandboxContext,
+    collect_worktree_changes,
     ensure_repo_and_worktree,
-    materialize_workspace_output,
     parse_stream_json_line,
+    release_worktree,
 )
 from app.workers.harnesses.claude import ClaudeCodeHarness
 from app.workers.harnesses.horizon import HorizonA2AHarness
@@ -47,17 +48,20 @@ __all__ = [
     "HarnessRegistry",
     "HorizonA2AHarness",
     "SandboxContext",
+    "SandboxExecResult",
     "SandboxProvisioner",
     "build_harness_system_prompt",
     "build_harness_user_prompt",
+    "collect_worktree_changes",
     "ensure_repo_and_worktree",
+    "exec_in_sandbox",
     "extract_plan_from_json_output",
     "get_coding_harness",
     "get_default_provision_recipe",
     "get_harness_registry",
     "get_sandbox_provisioner",
-    "materialize_workspace_output",
     "parse_stream_json_line",
+    "release_worktree",
     "reset_harness_registry",
     "reset_sandbox_provisioner",
 ]

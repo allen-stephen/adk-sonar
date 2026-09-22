@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
-from app.agent import cancel_task, dispatch_task, set_coding_harness, steer_task
+from app.agent import cancel_task, dispatch_task, set_coding_harness
 from app.auth import (
     build_oauth_authorize_url,
     detect_local_cli_token,
@@ -39,7 +39,11 @@ from app.auth import (
 from app.integrations import get_integration_registry
 from app.tasks import TaskHandle, get_task_registry
 from app.tools.workspace_tools import _git_info, get_workspace_root
-from app.workers import get_harness_registry, get_sandbox_provisioner
+from app.workers import (
+    HarnessNotProvisionedError,
+    get_harness_registry,
+    get_sandbox_provisioner,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["ui-control-plane"])
 
@@ -127,7 +131,9 @@ def record_context_surface(
     surface_id: str | None = None,
 ) -> None:
     """Records a live A2UI context surface from grounding, workspace, or MCP tool executions."""
-    sid = surface_id or f"a2ui-ctx-{int(asyncio.get_event_loop().time() * 1000) if asyncio.get_event_loop().is_running() else len(_context_surfaces) + 1}"
+    import time
+
+    sid = surface_id or f"a2ui-ctx-{int(time.monotonic() * 1000)}"
     _dismissed_surfaces.discard(sid)
     surface = {
         "version": "v0.9.1",
@@ -210,11 +216,15 @@ def _serialize_task(handle: TaskHandle) -> dict[str, Any]:
         "summary": handle.summary,
         "response_text": handle.response_text,
         "error": handle.error,
-        "files_changed": handle.files_changed or ["src/auth/jwt.py", "src/cache/redis_store.py"],
-        "questions": handle.questions,
+        "files_changed": list(handle.files_changed or []),
+        "questions": list(handle.questions or []),
         "awaiting_input": handle.awaiting_input,
+        "awaiting_approval": handle.awaiting_approval,
+        "diff_summary": handle.diff_summary,
+        "raw_diff": handle.raw_diff,
+        "pending_action": handle.pending_action,
         "latest_update": handle.latest_update,
-        "events": handle.events,
+        "events": list(handle.events or []),
         "milestones": _build_task_milestones(handle),
     }
 
@@ -226,8 +236,16 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         s for s in _context_surfaces if s["surfaceId"] not in _dismissed_surfaces
     ]
 
-    # Sort so awaiting_input comes first, then running, then completed
-    priority = {"awaiting_input": 0, "running": 1, "completed": 2}
+    # Priority order: awaiting_approval/awaiting_input first, then running, completed, failed/cancelled
+    priority = {
+        "awaiting_approval": 0,
+        "awaiting_input": 1,
+        "running": 2,
+        "completed": 3,
+        "failed": 4,
+        "cancelled": 5,
+        "orphaned": 6,
+    }
     sorted_tasks = sorted(tasks, key=lambda item: priority.get(item["status"], 9))
 
     for t in sorted_tasks:
@@ -237,16 +255,63 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if surface_id in _dismissed_surfaces:
             continue
 
-        if status == "awaiting_input":
+        if status == "awaiting_approval":
+            diff_text = t.get("diff_summary") or t.get("summary") or "Changes ready for review."
+            plan_steps = [diff_text]
+            options = ["Approve & Commit Changes", "Request Revisions"]
+            surfaces.append(
+                {
+                    "version": "v0.9.1",
+                    "surfaceId": surface_id,
+                    "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/adk-sonar/catalog.json",
+                    "kind": "plan_approval",
+                    "taskId": tid,
+                    "repo": t["repo"],
+                    "harness": t["harness"],
+                    "title": f"{tid.upper()} · APPROVAL REQUIRED",
+                    "subtitle": t.get("pending_action") or f"Diff ready for approval on {t['repo']}",
+                    "components": [
+                        {
+                            "id": "plan-steps",
+                            "component": "PlanSteps",
+                            "steps": plan_steps,
+                        },
+                        {
+                            "id": "choice-group",
+                            "component": "MultipleChoice",
+                            "options": options,
+                            "value": {"path": "/plan/selectedOption"},
+                        },
+                        {
+                            "id": "approve-btn",
+                            "component": "Button",
+                            "label": "Approve & Commit",
+                            "action": {
+                                "name": "approve_task",
+                                "taskId": tid,
+                            },
+                        },
+                    ],
+                    "dataModel": {
+                        "plan": {
+                            "steps": plan_steps,
+                            "selectedOption": options[0],
+                            "options": options,
+                            "goal": t["goal"],
+                        }
+                    },
+                }
+            )
+        elif status == "awaiting_input":
             questions = t.get("questions") or [
-                "Rotate JWT via Redis TTL (Recommended)",
-                "Stateless JWKS endpoint with 15m grace window",
+                "Review plan and proceed",
+                "Request alternate approach",
             ]
-            plan_steps = [
-                f"Add rotating refresh token store in {t['repo']}",
-                "Issue short-lived 15m access tokens with JTI validation",
-                "Run unit & integration test suite automatically after edits",
-            ]
+            plan_steps = (
+                [t["summary"]]
+                if t.get("summary")
+                else [f"Proposed implementation plan for {t['repo']}"]
+            )
             surfaces.append(
                 {
                     "version": "v0.9.1",
@@ -319,7 +384,13 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     },
                 }
             )
-        elif status == "completed":
+        elif status in ("completed", "failed", "cancelled", "orphaned"):
+            outcome_title = f"{tid.upper()} · {status.upper()}"
+            is_ok = status == "completed"
+            verification = (
+                t.get("summary")
+                or ("All tests passed · Changes applied" if is_ok else f"Task ended with status {status}")
+            )
             surfaces.append(
                 {
                     "version": "v0.9.1",
@@ -329,20 +400,20 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "taskId": tid,
                     "repo": t["repo"],
                     "harness": t["harness"],
-                    "title": f"{tid.upper()} · COMPLETED",
+                    "title": outcome_title,
                     "subtitle": t.get("summary")
-                    or f"All changes applied and verified in {t['repo']}.",
+                    or (f"All changes applied in {t['repo']}." if is_ok else f"Task {status}."),
                     "components": [
                         {
                             "id": "outcome-summary",
                             "component": "OutcomeSummary",
-                            "files": t.get("files_changed") or ["src/auth/jwt.py"],
+                            "files": t.get("files_changed") or [],
                         }
                     ],
                     "dataModel": {
                         "outcome": {
-                            "verification": "All tests passed · Changes applied automatically",
-                            "files": t.get("files_changed") or ["src/auth/jwt.py", "src/cache/redis_store.py"],
+                            "verification": verification,
+                            "files": t.get("files_changed") or [],
                             "milestones": t["milestones"],
                         }
                     },
@@ -402,8 +473,11 @@ async def get_orchestrator_state(request: Request) -> dict[str, Any]:
     tasks = [_serialize_task(t) for t in raw_tasks]
 
     running_count = sum(1 for t in tasks if t["status"] == "running")
-    awaiting_count = sum(1 for t in tasks if t["status"] == "awaiting_input")
+    awaiting_input_count = sum(1 for t in tasks if t["status"] == "awaiting_input")
+    awaiting_approval_count = sum(1 for t in tasks if t["status"] == "awaiting_approval")
     completed_count = sum(1 for t in tasks if t["status"] == "completed")
+    failed_count = sum(1 for t in tasks if t["status"] == "failed")
+    cancelled_count = sum(1 for t in tasks if t["status"] == "cancelled")
 
     integrations_list: list[dict[str, Any]] = []
     workspace_surfaces: list[dict[str, Any]] = []
@@ -483,8 +557,11 @@ async def get_orchestrator_state(request: Request) -> dict[str, Any]:
         "harnesses": harnesses,
         "task_counts": {
             "running": running_count,
-            "awaiting_input": awaiting_count,
+            "awaiting_input": awaiting_input_count,
+            "awaiting_approval": awaiting_approval_count,
             "completed": completed_count,
+            "failed": failed_count,
+            "cancelled": cancelled_count,
             "total": len(tasks),
         },
         "tasks": tasks,
@@ -517,14 +594,18 @@ async def api_update_preferences(req: UpdatePreferencesRequest) -> dict[str, Any
     """Update runtime timezone, agent voice persona, and spoken cadence preferences."""
     from app.tools.integration_tools import get_runtime_preferences
 
+    updates: dict[str, str | None] = {}
     if req.timezone is not None and req.timezone.strip():
-        _save_env_key("USER_TIMEZONE", req.timezone.strip())
+        updates["USER_TIMEZONE"] = req.timezone.strip()
     if req.voice_name is not None and req.voice_name.strip():
-        _save_env_key("LIVE_VOICE_NAME", req.voice_name.strip())
+        updates["LIVE_VOICE_NAME"] = req.voice_name.strip()
     if req.speech_style is not None and req.speech_style.strip():
-        _save_env_key("SPEECH_STYLE", req.speech_style.strip().lower())
+        updates["SPEECH_STYLE"] = req.speech_style.strip().lower()
     if req.ack_async_tools is not None:
-        _save_env_key("ACK_ASYNC_TOOLS", "true" if req.ack_async_tools else "false")
+        updates["ACK_ASYNC_TOOLS"] = "true" if req.ack_async_tools else "false"
+
+    if updates:
+        persist_env_vars(updates)
 
     return {
         "ok": True,
@@ -548,28 +629,25 @@ async def api_set_default_harness(req: SetHarnessRequest) -> dict[str, Any]:
 
 @router.post("/harnesses/{harness_name}/provision")
 async def api_provision_harness(harness_name: str) -> dict[str, Any]:
-    """Trigger background sandbox provisioning for the specified coding harness."""
+    """Run the sandbox provisioning preflight for the specified coding harness."""
     harness_reg = get_harness_registry()
     try:
         selected = harness_reg.get(harness_name)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    provisioner = get_sandbox_provisioner()
+    try:
+        state = await provisioner.ensure_provisioned(selected, force_refresh=True)
+    except HarnessNotProvisionedError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     return {
         "ok": True,
         "harness": selected.name,
         "display_name": selected.display_name,
-        "status": "provisioned",
-    }
-
-
-@router.post("/harnesses/{harness_name}/provision")
-async def api_provision_harness(harness_name: str) -> dict[str, Any]:
-    provisioner = get_sandbox_provisioner()
-    state = await provisioner.ensure_provisioned(harness_name)
-    return {
-        "ok": True,
-        "harness": harness_name,
         "status": state.status,
+        "error": state.error,
     }
 
 
@@ -601,33 +679,23 @@ async def api_steer_task(task_id: str, req: SteerTaskRequest) -> dict[str, Any]:
         else existing.harness
     )
 
-    async def _autonomous_execute_coro(tid: str, on_ev: Any) -> dict[str, Any]:
-        on_ev(
-            f"[{target_harness_name}] Applying approved plan ({req.instruction}) in shared worktree for {existing.repo}..."
-        )
-        await asyncio.sleep(2.2)
-        on_ev(f"Running unit & integration test suite in {existing.repo} (14/14 passing)...")
-        await asyncio.sleep(2.2)
-        return {
-            "exit_code": 0,
-            "summary": f"Implemented changes in {existing.repo} via {target_harness_name} ({req.instruction}). All unit tests passed and changes were committed automatically.",
-            "files_changed": existing.files_changed
-            or ["src/auth/jwt.py", "src/cache/redis_store.py", "tests/test_jwt.py"],
-            "questions": [],
-            "awaiting_input": False,
-        }
+    from app.agent import steer_task
+    from app.workers.harnesses.base import ensure_repo_and_worktree
 
-    await registry.resume(
-        key,
+    if not existing.worktree_path:
+        _, wt_dir, _ = ensure_repo_and_worktree(existing.repo, key)
+        existing.worktree_path = str(wt_dir)
+
+    msg = await steer_task(
+        task_id=key,
         instruction=req.instruction,
         mode=req.mode,
-        harness=target_harness_name,
-        task_coro_fn=_autonomous_execute_coro,
+        harness=req.harness or "",
     )
     return {
-        "ok": True,
+        "ok": not msg.startswith("Cannot ") and not msg.startswith("No task ") and not msg.startswith("Task "),
         "harness": target_harness_name,
-        "message": f"Approved {key} ({target_harness_name}); executing changes automatically.",
+        "message": msg,
     }
 
 
@@ -640,7 +708,10 @@ async def api_cancel_task(task_id: str) -> dict[str, Any]:
 @router.post("/tasks/demo")
 async def api_seed_demo_tasks() -> dict[str, Any]:
     """Seeds interactive fleet tasks declaratively from `config/workspaces.yaml` (`demo_tasks`)."""
-    from app.workers.harnesses.base import ensure_repo_and_worktree, load_workspaces_manifest
+    from app.workers.harnesses.base import (
+        ensure_repo_and_worktree,
+        load_workspaces_manifest,
+    )
 
     registry = get_task_registry()
     _dismissed_surfaces.clear()
@@ -1028,3 +1099,31 @@ async def api_import_dotenv(req: ImportDotenvRequest) -> dict[str, Any]:
         "imported_keys": imported,
         "count": len(imported),
     }
+
+
+@router.post("/internal/reconcile")
+async def api_trigger_reconciliation() -> dict[str, Any]:
+    """Cloud Scheduler endpoint to reconcile in-flight background harness tasks."""
+    from app.store.reconciler import reconcile_once
+
+    count = await reconcile_once()
+    return {"ok": True, "reconciled_runs": count}
+
+
+@router.post("/tasks/{task_id}/approve")
+async def api_approve_task(task_id: str) -> dict[str, Any]:
+    """Approve a task waiting at a human-in-the-loop (HITL) approval gate."""
+    from app.tasks import get_task_registry
+
+    reg = get_task_registry()
+    try:
+        handle = await reg.approve(task_id.strip().lower())
+        return {
+            "ok": True,
+            "task_id": handle.task_id,
+            "status": handle.status,
+            "summary": handle.summary,
+            "branch": handle.branch,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))

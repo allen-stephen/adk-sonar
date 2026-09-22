@@ -122,3 +122,14 @@ def test_integration_ordering_and_oauth_flows(monkeypatch) -> None:
     assert export_res.status_code == 200
     assert 'SPOTIFY_REFRESH_TOKEN="refresh-token-xyz"' in export_res.json()["dotenv"]
 
+
+def test_reconcile_and_approve_endpoints() -> None:
+    # 1. Test reconcile endpoint
+    res_rec = client.post("/api/v1/internal/reconcile")
+    assert res_rec.status_code == 200
+    assert res_rec.json()["ok"] is True
+
+    # 2. Test approve endpoint on non-existent task -> 404
+    res_app_missing = client.post("/api/v1/tasks/task-9999/approve")
+    assert res_app_missing.status_code == 404
+

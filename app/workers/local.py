@@ -65,29 +65,17 @@ class LocalWorker(WorkerBackend):
         harness_impl = get_coding_harness(harness or self.default_harness)
         task_dir = self.worktrees_dir / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
-        is_mock = os.getenv("MOCK_REMOTE_RUNNER", "true").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
         context = SandboxContext(
             user_id="local_user",
             sandbox_name="local-worktree",
             worktree_dir=task_dir,
             branch=f"agent/{task_id}",
-            mock_mode=is_mock,
         )
 
         try:
             await get_sandbox_provisioner().ensure_provisioned(
                 harness_impl,
-                SandboxContext(
-                    user_id="local_user",
-                    sandbox_name="local-worktree",
-                    worktree_dir=task_dir,
-                    branch=f"agent/{task_id}",
-                    mock_mode=True,
-                ),
+                context,
                 on_event=on_event,
                 task_id=task_id,
             )
@@ -104,7 +92,7 @@ class LocalWorker(WorkerBackend):
                 events=[err_msg],
             )
 
-        if harness_impl.execution_mode == "sandbox_a2a" or is_mock or mode == "plan":
+        if harness_impl.execution_mode == "sandbox_a2a":
             return await harness_impl.execute_in_sandbox(
                 goal=goal,
                 repo=repo,

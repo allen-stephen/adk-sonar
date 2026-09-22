@@ -25,8 +25,12 @@ def _client() -> genai.Client:
     """
     client = getattr(_local, "client", None)
     if client is None:
-        # AI Studio (GEMINI_API_KEY) or Agent Platform (ADC).
-        client = _local.client = genai.Client()
+        # AI Studio (GEMINI_API_KEY) or Agent Platform (ADC) with automatic retry on transient 503s.
+        client = _local.client = genai.Client(
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=6, initial_delay=1.5)
+            )
+        )
     return client
 
 

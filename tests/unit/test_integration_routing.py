@@ -40,8 +40,35 @@ def test_workspace_surfaces_removed_search_and_directory():
 
 
 @pytest.mark.asyncio
-async def test_downstream_integration_tools_and_runtime_toggle():
-    """Verify Spotify, Calendar, Gmail, Drive, Slack, and GitHub routing tools and runtime enable/disable."""
+async def test_downstream_integration_tools_and_runtime_toggle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify Spotify, Calendar, Gmail, Drive, Slack, and GitHub routing tools fail closed when unauthenticated and execute real HTTP routes when authenticated."""
+    # 1. Fail-closed when unauthenticated
+    for key in (
+        "SPOTIFY_ACCESS_TOKEN",
+        "SPOTIFY_REFRESH_TOKEN",
+        "GOOGLE_WORKSPACE_ACCESS_TOKEN",
+        "GOOGLE_WORKSPACE_REFRESH_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "GH_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert "not authenticated" in await spotify_playback(action="play", query="Deep Focus Electronic")
+    assert "not authenticated" in await calendar_events(action="list", time_window="today")
+    assert "not authenticated" in await gmail_messages(action="search", query="auth service")
+    assert "not authenticated" in await drive_files(action="search", query="token rotation PRD")
+    assert "not configured" in await slack_messages(action="read", channel="eng-alerts")
+    assert "not authenticated" in await github_operations(action="ci_status", repo="auth-svc")
+
+    # 2. Authenticated execution via integrations_transport
+    monkeypatch.setenv("SPOTIFY_ACCESS_TOKEN", "spotify-token-123")
+    monkeypatch.setenv("GOOGLE_WORKSPACE_ACCESS_TOKEN", "workspace-token-123")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "slack-token-123")
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "github-token-123")
+
     # Spotify
     out_spotify = await spotify_playback(action="play", query="Deep Focus Electronic")
     assert "Deep Focus Electronic" in out_spotify

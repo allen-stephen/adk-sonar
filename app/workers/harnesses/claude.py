@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from app.integrations import get_integration_registry
 from app.workers.base import WorkerExecutionResult
 from app.workers.harnesses.base import (
     HarnessEvent,
     SandboxContext,
-    materialize_workspace_output,
+    collect_worktree_changes,
+    exec_in_sandbox,
     parse_stream_json_line,
 )
 from app.workers.harnesses.prompts import (
     PLAN_OUTPUT_SCHEMA_JSON,
     build_harness_system_prompt,
+    extract_plan_from_json_output,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,7 @@ class ClaudeCodeHarness:
     )
     binary_name: str = "claude"
     fallback_binaries: tuple[str, ...] = ("claude",)
-    mock_step_delay_s: float = 0.05
+    live_timeout_s: float = 600.0
 
     def build_command(
         self,
@@ -153,14 +155,14 @@ class ClaudeCodeHarness:
             "CLAUDE_CODE_USE_VERTEX": os.getenv("CLAUDE_CODE_USE_VERTEX", "1"),
             "ANTHROPIC_VERTEX_PROJECT_ID": os.getenv(
                 "ANTHROPIC_VERTEX_PROJECT_ID",
-                os.getenv("GOOGLE_CLOUD_PROJECT", "agents-cli-test-dev-qi5zi1"),
+                os.getenv("GOOGLE_CLOUD_PROJECT", ""),
             ),
         }
 
-    def build_provision_commands(self) -> list[str]:
-        return [
-            "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code@latest",
-        ]
+    def build_provision_commands(self, profile: Any | None = None) -> list[str]:
+        from app.workers.harnesses.provisioner import get_default_provision_recipe
+
+        return list(get_default_provision_recipe("claude", profile=profile)["commands"])
 
     def parse_stream_line(self, line: str, task_id: str) -> HarnessEvent | None:
         return parse_stream_json_line(line, task_id, self.name)
@@ -177,6 +179,7 @@ class ClaudeCodeHarness:
         session_id: str | None = None,
         on_event: Callable[[HarnessEvent], None] | None = None,
     ) -> WorkerExecutionResult:
+        """Run headless Claude Code inside the provisioned Vertex Sandbox via `/exec`."""
         sess_id = session_id or f"claude-sess-{task_id}"
         branch = context.branch or f"agent/{task_id}"
         wt_path = str(context.worktree_dir or f"/workspace/.worktrees/{task_id}")
@@ -189,133 +192,111 @@ class ClaudeCodeHarness:
             worktree_path=wt_path,
             branch=branch,
         )
-        headers = context.build_sandbox_headers(port=context.exec_port)
         logger.info(
             "Sandbox /exec [%s] (port=%s, mode=%s, session=%s, worktree=%s): %s",
             self.name,
-            headers["X-Sandbox-Port"],
+            context.exec_port,
             mode,
             sess_id,
-            context.worktree_dir,
+            wt_path,
             cmd,
         )
 
+        def _fail(message: str, exit_code: int) -> WorkerExecutionResult:
+            logger.error("[%s] task %s failed: %s", self.name, task_id, message)
+            if on_event:
+                on_event(
+                    HarnessEvent(
+                        task_id=task_id,
+                        harness=self.name,
+                        kind="error",
+                        message=message,
+                    )
+                )
+            return WorkerExecutionResult(
+                exit_code=exit_code or 1,
+                summary=message,
+                response_text=message,
+                error=message,
+                claude_session_id=sess_id,
+                branch=branch,
+                worktree_path=wt_path,
+                harness=self.name,
+                events=[message],
+            )
+
+        exec_result = await exec_in_sandbox(
+            context,
+            f"mkdir -p {shlex.quote(wt_path)} && cd {shlex.quote(wt_path)} && {cmd}",
+            env=self.build_env(),
+            timeout_s=self.live_timeout_s,
+        )
+
+        if exec_result.error:
+            return _fail(
+                f"{self.display_name} could not reach the sandbox. {exec_result.error}",
+                exec_result.exit_code,
+            )
+
         if mode == "plan":
-            await asyncio.sleep(self.mock_step_delay_s)
-            questions = [
-                f"Should the implementation for '{goal}' in {repo} include automated tests or benchmarks?",
-                "Do you prefer a standalone module or integrating into existing utilities?",
-            ]
-            plan_text = f"Proposed plan from {self.display_name} for {goal} in {repo}."
+            if exec_result.exit_code != 0:
+                return _fail(
+                    f"{self.display_name} planning failed with exit code "
+                    f"{exec_result.exit_code}. {exec_result.stderr.strip()[:300]}",
+                    exec_result.exit_code,
+                )
+            parsed_sess, plan_summary, questions, _files = extract_plan_from_json_output(
+                exec_result.stdout,
+                fallback_session_id=sess_id,
+                goal=goal,
+                repo=repo,
+                display_name=self.display_name,
+            )
             if on_event:
                 on_event(
                     HarnessEvent(
                         task_id=task_id,
                         harness=self.name,
                         kind="approval_needed",
-                        message=plan_text,
+                        message=plan_summary,
                     )
                 )
             return WorkerExecutionResult(
                 exit_code=0,
-                summary=plan_text,
-                response_text=plan_text,
-                claude_session_id=sess_id,
+                summary=plan_summary,
+                response_text=plan_summary,
+                claude_session_id=parsed_sess,
                 questions=questions,
                 awaiting_input=True,
                 branch=branch,
                 worktree_path=wt_path,
                 harness=self.name,
-                events=[plan_text],
+                events=[plan_summary],
             )
 
         events_log: list[str] = []
-        if context.mock_mode:
-            simulated_lines = [
-                json.dumps({"type": "tool_use", "name": "Bash"}),
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "text": f"Claude Code analyzing {repo} in worktree {branch} for goal: {goal}",
-                    }
-                ),
-                json.dumps(
-                    {
-                        "type": "result",
-                        "is_error": False,
-                        "result": (
-                            f"Task {task_id} completed by Claude Code in sandbox "
-                            f"{context.sandbox_name}. Branch {branch} updated."
-                        ),
-                    }
-                ),
-            ]
-            final_summary = ""
-            for raw_line in simulated_lines:
-                await asyncio.sleep(self.mock_step_delay_s)
-                ev = self.parse_stream_line(raw_line, task_id)
-                if ev:
-                    events_log.append(ev.message)
-                    if on_event:
-                        on_event(ev)
-                    if ev.kind == "completed":
-                        final_summary = ev.message
+        for raw_line in exec_result.stdout.splitlines():
+            ev = self.parse_stream_line(raw_line, task_id)
+            if ev:
+                events_log.append(ev.message)
+                if on_event:
+                    on_event(ev)
 
-            changed, actual_branch, actual_wt, diff_sum, raw_diff = (
-                materialize_workspace_output(repo, task_id, goal, self.display_name)
-            )
-            pending = (
-                f"git commit and push branch {actual_branch} and open PR"
-                if require_approval
-                else None
-            )
-            return WorkerExecutionResult(
-                exit_code=0,
-                summary=final_summary,
-                response_text=final_summary,
-                claude_session_id=sess_id,
-                files_changed=changed,
-                awaiting_approval=require_approval,
-                diff_summary=diff_sum,
-                raw_diff=raw_diff,
-                pending_action=pending,
-                branch=actual_branch,
-                worktree_path=actual_wt,
-                harness=self.name,
-                events=events_log,
+        if exec_result.exit_code != 0:
+            detail = exec_result.stderr.strip() or (events_log[-1] if events_log else "")
+            return _fail(
+                f"{self.display_name} exited with code {exec_result.exit_code}. {detail[:300]}",
+                exec_result.exit_code,
             )
 
-        # Live execution inside the provisioned Vertex Agent Engine Sandbox (/exec)
-        import httpx
-
-        exec_url = f"https://{context.lb_host}/exec"
-        try:
-            async with httpx.AsyncClient(headers=headers, timeout=180.0) as client:
-                resp = await client.post(
-                    exec_url,
-                    json={
-                        "command": f"mkdir -p {shlex.quote(wt_path)} && ({cmd} || echo 'Executed in sandbox {context.sandbox_name}')",
-                        "env": self.build_env(),
-                    },
-                )
-                data = resp.json() if resp.status_code == 200 and resp.content else {}
-                stdout = (data.get("stdout") or data.get("output") or "").strip()
-                for raw_line in stdout.splitlines():
-                    ev = self.parse_stream_line(raw_line, task_id)
-                    if ev:
-                        events_log.append(ev.message)
-                        if on_event:
-                            on_event(ev)
-        except Exception as exc:
-            logger.warning("Live sandbox /exec note (%s): %s", self.name, exc)
-
-        changed, actual_branch, actual_wt, diff_sum, raw_diff = (
-            materialize_workspace_output(repo, task_id, goal, self.display_name)
-        )
+        changed, diff_sum, raw_diff = await collect_worktree_changes(wt_path, context=context)
         summary = (
             events_log[-1]
             if events_log
-            else f"Task {task_id} completed by {self.display_name} in Vertex Sandbox {context.sandbox_name.split('/')[-1]}."
+            else (
+                f"Task {task_id} completed by {self.display_name} in sandbox "
+                f"{context.sandbox_name.split('/')[-1]}."
+            )
         )
         return WorkerExecutionResult(
             exit_code=0,
@@ -326,8 +307,13 @@ class ClaudeCodeHarness:
             awaiting_approval=require_approval,
             diff_summary=diff_sum,
             raw_diff=raw_diff,
-            branch=actual_branch,
-            worktree_path=actual_wt,
+            pending_action=(
+                f"git commit and push branch {branch} and open PR"
+                if require_approval
+                else None
+            ),
+            branch=branch,
+            worktree_path=wt_path,
             harness=self.name,
             events=events_log,
         )

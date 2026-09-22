@@ -1,4 +1,4 @@
-"""Task management, per-task worktree tracking, and HITL approval gates for sandboxed coding harnesses."""
+"""TaskRegistry managing concurrency, remote task execution, HITL approval, and lifecycle."""
 
 from __future__ import annotations
 
@@ -7,123 +7,19 @@ import inspect
 import logging
 import subprocess
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.tasks.handle import TaskHandle, apply_result_to_handle
+from app.tasks.persistence import is_store_active, persist_handle
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TaskHandle:
-    task_id: str
-    goal: str
-    repo: str
-    async_task: asyncio.Task
-    started_at: float
-    harness: str = "claude"
-    mode: str = "execute"
-    branch: str | None = None
-    worktree_path: str | None = None
-    consumed: bool = False
-    exit_code: int | None = None
-    summary: str | None = None
-    error: str | None = None
-    response_text: str | None = None
-    claude_session_id: str | None = None
-    files_changed: list[str] = field(default_factory=list)
-    questions: list[str] = field(default_factory=list)
-    awaiting_input: bool = False
-    awaiting_approval: bool = False
-    diff_summary: str | None = None
-    raw_diff: str | None = None
-    pending_action: str | None = None
-    approved_at: float | None = None
-    latest_update: str | None = None
-    events: list[str] = field(default_factory=list)
-
-    @property
-    def status(self) -> str:
-        if self.async_task.cancelled():
-            return "cancelled"
-        if not self.async_task.done():
-            return "running"
-        if self.error or (self.exit_code is not None and self.exit_code != 0):
-            return "failed"
-        if self.awaiting_input or self.questions:
-            return "awaiting_input"
-        if self.awaiting_approval:
-            return "awaiting_approval"
-        return "completed"
-
-    @property
-    def elapsed_seconds(self) -> int:
-        return int(time.monotonic() - self.started_at)
-
-    def record_event(self, event: Any) -> None:
-        """Record a non-blocking progress event emitted by the running harness."""
-        msg = getattr(event, "message", None) or str(event)
-        self.latest_update = msg
-        self.events.append(msg)
-
-
-def _apply_result_to_handle(handle: TaskHandle, result: Any) -> None:
-    if hasattr(result, "exit_code"):
-        handle.exit_code = result.exit_code
-        handle.summary = result.summary or "Task completed."
-        handle.response_text = (
-            getattr(result, "response_text", None) or handle.summary
-        )
-        handle.claude_session_id = (
-            getattr(result, "claude_session_id", None)
-            or handle.claude_session_id
-        )
-        handle.files_changed = list(getattr(result, "files_changed", []) or [])
-        handle.questions = list(getattr(result, "questions", []) or [])
-        handle.awaiting_input = bool(
-            getattr(result, "awaiting_input", False) or handle.questions
-        )
-        handle.awaiting_approval = bool(
-            getattr(result, "awaiting_approval", False)
-        )
-        handle.diff_summary = getattr(result, "diff_summary", None)
-        handle.raw_diff = getattr(result, "raw_diff", None)
-        handle.pending_action = getattr(result, "pending_action", None)
-        if getattr(result, "branch", None):
-            handle.branch = result.branch
-        if getattr(result, "worktree_path", None):
-            handle.worktree_path = result.worktree_path
-        if getattr(result, "harness", None):
-            handle.harness = result.harness
-        if getattr(result, "events", None) and not handle.events:
-            handle.events.extend(result.events)
-            handle.latest_update = handle.events[-1]
-    elif isinstance(result, dict):
-        handle.exit_code = result.get("exit_code", 0)
-        handle.summary = result.get("summary", "Task completed.")
-        handle.response_text = result.get("response_text", handle.summary)
-        handle.claude_session_id = result.get("claude_session_id")
-        handle.files_changed = list(result.get("files_changed", []))
-        handle.questions = list(result.get("questions", []))
-        handle.awaiting_input = bool(
-            result.get("awaiting_input", False) or handle.questions
-        )
-        handle.awaiting_approval = bool(result.get("awaiting_approval", False))
-        handle.diff_summary = result.get("diff_summary")
-        handle.raw_diff = result.get("raw_diff")
-        handle.pending_action = result.get("pending_action")
-    else:
-        handle.exit_code = 0
-        handle.summary = str(result)
-        handle.response_text = handle.summary
-
-
 
 
 class TaskRegistry:
     """Singleton registry holding tracked remote coding tasks across harnesses."""
 
-    MAX_CONCURRENT_TASKS = 5
+    MAX_CONCURRENT_TASKS = 20
 
     def __init__(self) -> None:
         self._tasks: dict[str, TaskHandle] = {}
@@ -149,6 +45,8 @@ class TaskRegistry:
                     "Wait for a task to finish or cancel an existing one."
                 )
 
+            while f"task-{self._next_id}" in self._tasks:
+                self._next_id += 1
             task_id = f"task-{self._next_id}"
             self._next_id += 1
 
@@ -165,16 +63,21 @@ class TaskRegistry:
                     else:
                         result = await task_coro_fn()
 
-                    _apply_result_to_handle(handle, result)
+                    apply_result_to_handle(handle, result)
+                    await persist_handle(handle, ended=True)
                 except asyncio.CancelledError:
                     if handle_ref:
                         handle_ref[0].summary = "Task was cancelled."
+                        handle_ref[0].status = "cancelled"
+                        await persist_handle(handle_ref[0], ended=True)
                     raise
                 except Exception as exc:
                     logger.exception("Task %s failed", task_id)
                     if handle_ref:
                         handle_ref[0].error = str(exc)
                         handle_ref[0].exit_code = 1
+                        handle_ref[0].status = "failed"
+                        await persist_handle(handle_ref[0], ended=True)
 
             handle_holder: list[Any] = []
             async_task = asyncio.create_task(
@@ -190,10 +93,13 @@ class TaskRegistry:
                 branch=f"agent/{task_id}",
                 async_task=async_task,
                 started_at=time.monotonic(),
+                _status="running",
             )
             handle_holder.append(handle)
             self._tasks[task_id] = handle
-            return task_id, handle
+
+        await persist_handle(handle, new_run=True)
+        return task_id, handle
 
     async def resume(
         self,
@@ -204,11 +110,11 @@ class TaskRegistry:
         task_coro_fn: Any,
         harness: str | None = None,
     ) -> TaskHandle:
-        async with self._lock:
-            handle = self._tasks.get(task_id)
-            if not handle:
-                raise ValueError(f"Task {task_id} was not found.")
+        handle = await self.get(task_id)
+        if not handle:
+            raise ValueError(f"Task {task_id} was not found.")
 
+        async with self._lock:
             if harness:
                 handle.harness = harness
             handle.goal = f"{handle.goal} | Follow-up: {instruction}"
@@ -216,6 +122,7 @@ class TaskRegistry:
             handle.questions = []
             handle.awaiting_input = False
             handle.awaiting_approval = False
+            handle.status = "running"
             handle.consumed = False
             handle.error = None
             handle.exit_code = 0
@@ -229,28 +136,35 @@ class TaskRegistry:
                         result = await task_coro_fn(task_id)
                     else:
                         result = await task_coro_fn()
-                    _apply_result_to_handle(handle, result)
+                    apply_result_to_handle(handle, result)
+                    await persist_handle(handle, ended=True)
                 except asyncio.CancelledError:
                     handle.summary = "Task was cancelled."
+                    handle.status = "cancelled"
+                    await persist_handle(handle, ended=True)
                     raise
                 except Exception as exc:
                     logger.exception("Task %s failed on resume", task_id)
                     handle.error = str(exc)
                     handle.exit_code = 1
+                    handle.status = "failed"
+                    await persist_handle(handle, ended=True)
 
             handle.async_task = asyncio.create_task(
                 _resume_wrapper(),
                 name=f"remote-resume-{task_id}",
             )
-            return handle
+
+        await persist_handle(handle, new_run=True, instruction=instruction)
+        return handle
 
     async def approve(self, task_id: str) -> TaskHandle:
         """Approve a task waiting at a CUJ 3 HITL approval gate, committing its worktree branch."""
-        async with self._lock:
-            handle = self._tasks.get(task_id)
-            if not handle:
-                raise ValueError(f"Task {task_id} was not found.")
+        handle = await self.get(task_id)
+        if not handle:
+            raise ValueError(f"Task {task_id} was not found.")
 
+        async with self._lock:
             if handle.worktree_path and Path(handle.worktree_path).exists():
                 subprocess.run(
                     ["git", "-C", handle.worktree_path, "add", "."],
@@ -275,33 +189,81 @@ class TaskRegistry:
                 )
 
             handle.awaiting_approval = False
+            handle.status = "completed"
             handle.approved_at = time.time()
             handle.consumed = False
             branch_label = handle.branch or f"agent/{handle.task_id}"
             handle.summary = (
                 f"Approved and committed changes on branch {branch_label} for {handle.repo}."
             )
-            return handle
+            repo_name = handle.repo
+
+        await persist_handle(handle, ended=True)
+
+        # Outside the lock: the commit above means the branch now holds the work,
+        # so the checkout can be reclaimed. Kept off the lock (and off the event
+        # loop) because `approve` already blocks on git while holding it, which
+        # stalls the live audio stream.
+        from app.workers.harnesses.base import release_worktree
+
+        if await asyncio.to_thread(release_worktree, repo_name, task_id):
+            handle.worktree_path = None
+
+        return handle
 
     async def get(self, task_id: str) -> TaskHandle | None:
         async with self._lock:
-            return self._tasks.get(task_id)
+            existing = self._tasks.get(task_id)
+            if existing is not None:
+                return existing
+
+        if is_store_active():
+            try:
+                from app.store.task_store import get_task_store
+
+                rec = await get_task_store().get_task(task_id)
+                if rec is not None:
+                    hydrated = rec.to_task_handle()
+                    async with self._lock:
+                        self._tasks[rec.short_id] = hydrated
+                    return hydrated
+            except Exception as exc:
+                logger.debug("TaskStore hydration on get skipped: %s", exc)
+        return None
 
     async def list_all(self) -> list[TaskHandle]:
+        if is_store_active():
+            try:
+                from app.store.task_store import get_task_store
+
+                records = await get_task_store().list_tasks(limit=50)
+                async with self._lock:
+                    for rec in reversed(records):
+                        if rec.short_id not in self._tasks:
+                            self._tasks[rec.short_id] = rec.to_task_handle()
+            except Exception as exc:
+                logger.debug("TaskStore hydration on list_all skipped: %s", exc)
+
         async with self._lock:
             return list(self._tasks.values())
 
+    def snapshot_tasks(self) -> list[TaskHandle]:
+        """Return a synchronous snapshot of in-memory tasks (hydrated via list_all in before_agent_callback)."""
+        return list(self._tasks.values())
+
     async def list_running(self) -> list[TaskHandle]:
-        async with self._lock:
-            return [t for t in self._tasks.values() if t.status == "running"]
+        all_items = await self.list_all()
+        return [t for t in all_items if t.status == "running"]
 
     async def cancel(self, task_id: str) -> bool:
-        async with self._lock:
-            handle = self._tasks.get(task_id)
+        handle = await self.get(task_id)
         if not handle:
             return False
         if handle.status == "running":
-            handle.async_task.cancel()
+            if handle.async_task is not None:
+                handle.async_task.cancel()
+            handle.status = "cancelled"
+            await persist_handle(handle, ended=True)
             return True
         return False
 

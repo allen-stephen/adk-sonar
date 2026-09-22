@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
+import logging
 import os
-
 from typing import Any
 
 from google.adk.agents import Agent
@@ -27,6 +28,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.apps import App
 from google.adk.models import Gemini
 from google.adk.tools import FunctionTool
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 from google.genai import types
 
 from app.integrations import (
@@ -105,9 +107,66 @@ _mcp_toolsets = (
     else []
 )
 
+async def _hydrate_task_store_callback(callback_context: Any) -> None:
+    """Hydrates persisted tasks from TaskStore before the turn so _build_task_briefing sees all records."""
+    try:
+        from app.tasks import get_task_registry
+
+        await get_task_registry().list_all()
+    except Exception:
+        pass
+
+
+def _build_task_briefing() -> str:
+    """Dynamically builds a concise spoken briefing of active or recently completed tasks."""
+    try:
+        from app.tasks import get_task_registry
+
+        reg = get_task_registry()
+        tasks = reg.snapshot_tasks()
+        if not tasks:
+            return ""
+
+        active_items: list[str] = []
+        for t in tasks:
+            if t.status == "awaiting_approval":
+                active_items.append(
+                    f"- {t.task_id} on {t.repo}: changes ready for review and diff approval on branch {t.branch}"
+                )
+            elif t.status == "awaiting_input":
+                qs = ", ".join(t.questions[:2]) if t.questions else "clarification required"
+                active_items.append(
+                    f"- {t.task_id} on {t.repo}: waiting for user guidance ({qs})"
+                )
+            elif t.status == "running":
+                active_items.append(
+                    f"- {t.task_id} on {t.repo}: currently running ({t.harness})"
+                )
+
+        if not active_items:
+            recent = [t for t in tasks if t.status == "completed"]
+            if recent:
+                last = recent[-1]
+                active_items.append(
+                    f"- {last.task_id} on {last.repo}: recently completed ({last.summary or 'all changes verified'})"
+                )
+
+        if not active_items:
+            return ""
+
+        return (
+            "ACTIVE & RECENT BACKGROUND CODING TASKS (SITUATIONAL AWARENESS):\n"
+            + "\n".join(active_items)
+            + "\nIf the user opens with a greeting or asks for status, naturally brief them in one or two sentences.\n\n"
+        )
+    except Exception:
+        return ""
+
+
 def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
     """Dynamically constructs the system instruction with the user's active timezone, local time, and voice settings."""
     prefs = get_runtime_preferences()
+    task_briefing = _build_task_briefing()
     style_map = {
         "concise": "Keep turns ultra-brief and operational (one to two sentences max) with zero conversational filler.",
         "balanced": "Keep turns clear and natural (two to three sentences) with helpful context.",
@@ -120,6 +179,7 @@ def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
         "You coordinate concurrent coding agents inside an isolated Vertex Agent Platform Sandbox "
         "(using per-task git worktrees across configurable harnesses such as Claude Code, ADK Long Horizon, "
         "and Antigravity) while also operating across a dynamic set of workspace, grounding, and MCP integration tools.\n\n"
+        f"{task_briefing}"
         "USER TIMEZONE & TEMPORAL CONTEXT:\n"
         f"- Active User Timezone: {prefs['timezone']} ({prefs['tz_abbrev']}, {prefs['tz_offset']})\n"
         f"- Current Local Date & Time: {prefs['local_time_formatted']}\n"
@@ -168,6 +228,47 @@ def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
     )
 
 
+def _apply_live_voice_config(
+    callback_context: Any,
+    llm_request: Any,
+) -> None:
+    """Injects the user's selected PrebuiltVoiceConfig into the Gemini Live connection setup."""
+    prefs = get_runtime_preferences()
+    voice_name = prefs.get("voice_name") or "Aoede"
+    speech_cfg = types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                voice_name=voice_name,
+            )
+        )
+    )
+    if getattr(llm_request, "live_connect_config", None) is not None:
+        llm_request.live_connect_config.speech_config = speech_cfg
+    if getattr(llm_request, "config", None) is not None:
+        llm_request.config.speech_config = speech_cfg
+
+
+logger = logging.getLogger(__name__)
+
+
+async def non_blocking_memory_capture(callback_context: Any) -> None:
+    """Fire-and-forget memory capture that runs in the background to ensure zero impact on end-user voice latency."""
+    if not hasattr(callback_context, "add_session_to_memory"):
+        return
+
+    async def _capture_in_background() -> None:
+        try:
+            await callback_context.add_session_to_memory()
+        except Exception as exc:
+            logger.debug("Memory capture skipped or failed: %s", exc)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_capture_in_background(), name="memory-capture-bg")
+    except RuntimeError:
+        pass
+
+
 root_agent = Agent(
     name="voice_orchestrator",
     model=Gemini(
@@ -175,7 +276,11 @@ root_agent = Agent(
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=build_orchestrator_instruction,
+    before_agent_callback=_hydrate_task_store_callback,
+    before_model_callback=_apply_live_voice_config,
+    after_agent_callback=non_blocking_memory_capture,
     tools=[
+        PreloadMemoryTool(),
         non_blocking_tool(dispatch_task),
         get_task_result,
         non_blocking_tool(steer_task),

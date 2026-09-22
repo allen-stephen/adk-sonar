@@ -6,18 +6,15 @@ import asyncio
 import json
 import time
 from pathlib import Path
+
 import httpx
 import pytest
 
 from app.agent import (
     approve_task,
-    cancel_task,
     dispatch_task,
     get_task_result,
-    list_harnesses,
-    list_tasks,
     set_coding_harness,
-    watch_tasks,
 )
 from app.tasks import get_task_registry, reset_task_registry
 from app.workers import (
@@ -29,6 +26,13 @@ from app.workers import (
     reset_harness_registry,
     reset_sandbox_provisioner,
     reset_worker_backend,
+)
+from tests.fakes import (
+    exec_transport,
+    install_worker,
+    register_fake_harnesses,
+    sandbox_connection,
+    sandbox_transport,
 )
 
 
@@ -154,7 +158,6 @@ async def test_horizon_remote_a2a_agent_inside_sandbox():
 
     harness = HorizonA2AHarness(
         http_transport=httpx.MockTransport(custom_a2a_handler),
-        mock_step_delay_s=0.05,
     )
     ctx = SandboxContext(
         user_id="alice",
@@ -163,7 +166,6 @@ async def test_horizon_remote_a2a_agent_inside_sandbox():
         routing_token="sandbox-route-xyz",
         sandbox_token="sandbox-jwt-token",
         a2a_port=8081,
-        mock_mode=False,
     )
 
     streamed_events = []
@@ -188,10 +190,23 @@ async def test_non_blocking_multi_harness_and_worktree_isolation(
 ):
     """Validate 1-to-many concurrent tasks (including two Claude instances + one Horizon) on the SAME repo use isolated git worktrees."""
     monkeypatch.setenv("ORCHESTRATOR_WORKSPACE_ROOT", str(tmp_path))
-    reg = get_harness_registry()
-    for name in ("claude", "horizon", "antigravity"):
-        h = reg.get(name)
-        h.mock_step_delay_s = 0.12  # type: ignore[attr-defined]
+
+    # Stand in for the harnesses themselves; this test is about concurrency,
+    # worktree isolation, and the approval gate, not harness internals.
+    register_fake_harnesses(
+        "claude",
+        "horizon",
+        "antigravity",
+        summary="Fake harness finished the task.",
+        writes={"generated_change.py": "# written by the fake harness\n"},
+    )
+    install_worker(
+        monkeypatch,
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=sandbox_transport(exec_exit_code=0),
+        ),
+    )
 
     # Dispatch 3 concurrent agents on the SAME repository ('shared-api'):
     # two Claude Code instances + one ADK Long Horizon instance
@@ -225,9 +240,14 @@ async def test_non_blocking_multi_harness_and_worktree_isolation(
     assert h3.branch == "agent/task-3" and h3.worktree_path and Path(h3.worktree_path).exists()
     assert h1.worktree_path != h2.worktree_path != h3.worktree_path
 
-    # Verify task-3 paused in CUJ 3 'awaiting_approval' with a diff summary and raw diff
+    # Each worktree received its own real copy of the harness's edit
+    for handle in (h1, h2, h3):
+        assert (Path(handle.worktree_path) / "generated_change.py").exists()
+
+    # Verify task-3 paused in CUJ 3 'awaiting_approval' with a real change summary
     assert h3.status == "awaiting_approval"
-    assert h3.diff_summary and "+4 -0" in h3.diff_summary
+    assert h3.diff_summary and "1 file(s) changed" in h3.diff_summary
+    assert h3.pending_action and "agent/task-3" in h3.pending_action
     res3 = await get_task_result("task-3")
     assert "HITL Approval Gate" in res3
 
@@ -251,28 +271,39 @@ async def test_sandbox_provisioner_github_upgrade_and_preflight_gate(
     assert h_status.status == "unprovisioned"
     assert h_status.version == "git:main@latest"
 
-    # 2. Switching default harness triggers background warm-up and provisions latest GitHub code
-    await set_coding_harness("horizon")
-    await asyncio.sleep(0.05)  # allow background warm-up task to complete
+    # 2. Provisioning runs the latest GitHub package spec and starts the A2A daemon.
+    #    `sandbox_transport` answers both the /exec install commands and the
+    #    agent-card health probe Horizon uses (execution_mode == "sandbox_a2a").
+    horizon = get_harness_registry().get("horizon")
+    ready_ctx = SandboxContext(http_transport=sandbox_transport(exec_exit_code=0))
+    state = await provisioner.ensure_provisioned(horizon, ready_ctx)
 
-    h_status = provisioner.get_status("horizon")
-    assert h_status.status == "ready"
+    assert state.status == "ready"
     assert any(
         "git+https://github.com/google/adk-samples.git#subdirectory=core/python/long-horizon-harness"
         in cmd
-        for cmd in h_status.commands_executed
+        for cmd in state.commands_executed
     )
     assert any(
         "LHA_ENVIRONMENT_BACKEND=local" in cmd and "horizon.fast_api_app:app" in cmd
-        for cmd in h_status.commands_executed
+        for cmd in state.commands_executed
     )
 
-    # 3. Simulate a provisioning failure and verify SandboxWorker blocks task execution at the preflight gate
+    # 3. Switching the default harness still triggers an eager background warm-up
+    switch_msg = await set_coding_harness("horizon")
+    assert "ADK Long Horizon" in switch_msg
+
+    # 4. A failing provisioning command must block task execution at the preflight gate
     reset_sandbox_provisioner()
     provisioner = get_sandbox_provisioner()
-    provisioner.simulate_failure("horizon", "GitHub repository unreachable (HTTP 503)")
 
-    worker = SandboxWorker(mock_mode=True)
+    worker = SandboxWorker(
+        connection=sandbox_connection(),
+        http_transport=sandbox_transport(
+            exec_exit_code=1,
+            exec_stderr="GitHub repository unreachable (HTTP 503)",
+        ),
+    )
     blocked_res = await worker.execute_task(
         goal="Refactor auth service",
         repo="auth-svc",
@@ -282,7 +313,22 @@ async def test_sandbox_provisioner_github_upgrade_and_preflight_gate(
     assert blocked_res.exit_code == 1
     assert blocked_res.error is not None
     assert "GitHub repository unreachable" in blocked_res.error
-    assert provisioner.get_status("horizon").status == "error"
+    assert provisioner.get_status("horizon", "voice-worker-test").status == "error"
+
+    # 5. An unreachable sandbox (502 / "No healthy upstream") must also block, not pass
+    reset_sandbox_provisioner()
+    dead_worker = SandboxWorker(
+        connection=sandbox_connection(),
+        http_transport=exec_transport(status_code=502),
+    )
+    dead_res = await dead_worker.execute_task(
+        goal="Refactor auth service",
+        repo="auth-svc",
+        task_id="task-dead",
+        harness="claude",
+    )
+    assert dead_res.exit_code != 0
+    assert dead_res.error is not None
 
 
 def test_headless_2_phase_invocations_and_stream_json_parsing():
@@ -420,10 +466,28 @@ async def test_declarative_sandbox_seeding_and_cross_harness_worktree_transition
 
     monkeypatch.setenv("ORCHESTRATOR_WORKSPACE_ROOT", str(tmp_path))
 
+    fakes = register_fake_harnesses(
+        "claude",
+        "antigravity",
+        questions=["Redis Token Store or in-process cache?"],
+        summary="Applied the approved plan.",
+        writes={"task_1_output.py": "# applied by the fake harness\n"},
+    )
+    fakes["claude"].display_name = "Claude Code"
+    fakes["antigravity"].display_name = "Antigravity"
+    install_worker(
+        monkeypatch,
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=sandbox_transport(exec_exit_code=0),
+        ),
+    )
+
     # 1. Provision shared sandbox and seed declarative repositories
     summary = await provision_shared_sandbox(
         user_id="dev_test",
         workspace_root=tmp_path,
+        http_transport=sandbox_transport(exec_exit_code=0),
     )
     assert "auth-svc" in summary["seeded_repositories"]
     assert "analytics-svc" in summary["seeded_repositories"]

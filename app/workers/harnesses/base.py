@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import shlex
+import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -12,6 +17,9 @@ from typing import Any, Protocol, runtime_checkable
 from app.tools.workspace_tools import get_workspace_root
 from app.workers.base import WorkerExecutionResult
 
+logger = logging.getLogger(__name__)
+
+
 
 @dataclass
 class SandboxContext:
@@ -19,14 +27,24 @@ class SandboxContext:
 
     user_id: str = "default_user"
     sandbox_name: str = "voice-worker-default_user"
-    lb_host: str = "mock-sandbox-lb.aiplatform.googleapis.com"
-    routing_token: str = "mock-token"
-    sandbox_token: str = "mock-auth"
+    lb_host: str = field(
+        default_factory=lambda: os.getenv(
+            "VERTEX_SANDBOX_LB_HOST", "sandbox.aiplatform.googleapis.com"
+        )
+    )
+    routing_token: str = field(
+        default_factory=lambda: os.getenv("VERTEX_SANDBOX_ROUTING_TOKEN", "sandbox-routing-token")
+    )
+    sandbox_token: str = field(
+        default_factory=lambda: os.getenv("VERTEX_SANDBOX_TOKEN", "sandbox-auth-token")
+    )
     exec_port: int = 8080
     a2a_port: int = 8081
     worktree_dir: Path | None = None
     branch: str | None = None
-    mock_mode: bool = True
+    # Optional httpx transport override. Production leaves this as None; tests
+    # inject an `httpx.MockTransport` to drive the real harness code paths.
+    http_transport: Any | None = None
 
     def build_sandbox_headers(self, port: int | None = None) -> dict[str, str]:
         """Return Vertex Agent Platform Sandbox routing headers for a container port."""
@@ -47,6 +65,336 @@ class HarnessEvent:
     kind: str  # "progress" | "approval_needed" | "completed" | "error"
     message: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SandboxExecResult:
+    """Outcome of a single `/exec` shell invocation inside the Vertex Sandbox.
+
+    `error` is set only for transport-level failures (unreachable host, timeout,
+    non-2xx response, unparseable body). A command that ran and failed is
+    reported with `error=None` and a non-zero `exit_code`, so callers can
+    distinguish "the sandbox is broken" from "the command failed".
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.exit_code == 0
+
+
+async def exec_in_sandbox(
+    context: SandboxContext,
+    command: str,
+    *,
+    env: dict[str, str] | None = None,
+    timeout_s: float = 180.0,
+    transport: Any | None = None,
+) -> SandboxExecResult:
+    """POST a shell command to the Vertex Sandbox `/exec` endpoint (Port 8080).
+
+    This is the single HTTP seam for sandbox command execution, so tests can
+    inject an `httpx.MockTransport` and assert on routing headers, non-2xx
+    handling, and timeout behavior.
+
+    Never raises and never fabricates success: transport failures come back as
+    `SandboxExecResult(exit_code=1, error=...)`.
+    """
+    import httpx
+
+    headers = context.build_sandbox_headers(port=context.exec_port)
+    exec_url = f"https://{context.lb_host}/exec"
+    try:
+        async with httpx.AsyncClient(
+            transport=transport if transport is not None else context.http_transport,
+            headers=headers,
+            timeout=httpx.Timeout(timeout_s, connect=15.0),
+        ) as client:
+            resp = await client.post(
+                exec_url,
+                json={"command": command, "env": env or {}},
+            )
+    except Exception as exc:
+        return SandboxExecResult(
+            exit_code=1,
+            error=f"Sandbox /exec unreachable at {context.lb_host}: {exc}",
+        )
+
+    if resp.status_code >= 400:
+        return SandboxExecResult(
+            exit_code=resp.status_code,
+            error=(
+                f"Sandbox /exec returned HTTP {resp.status_code} "
+                f"from {context.lb_host}: {resp.text[:300]}"
+            ),
+        )
+
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception as exc:
+        return SandboxExecResult(
+            exit_code=1,
+            error=f"Sandbox /exec returned an unparseable response body: {exc}",
+        )
+
+    if not isinstance(data, dict):
+        return SandboxExecResult(
+            exit_code=1,
+            error=f"Sandbox /exec returned unexpected payload type {type(data).__name__}.",
+        )
+
+    stdout = str(data.get("stdout") or data.get("output") or "")
+    stderr = str(data.get("stderr") or "")
+
+    # An absent exit_code reasonably means "the sandbox didn't say", so default
+    # to 0. A present but non-numeric one is a broken contract, and coercing it
+    # to 0 would report a malformed response as a successful command.
+    raw_exit_code = data.get("exit_code", 0)
+    try:
+        exit_code = int(raw_exit_code)
+    except (TypeError, ValueError):
+        return SandboxExecResult(
+            exit_code=1,
+            stdout=stdout,
+            stderr=stderr,
+            error=(
+                "Sandbox /exec returned a non-numeric exit_code "
+                f"({raw_exit_code!r}) from {context.lb_host}."
+            ),
+        )
+    return SandboxExecResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
+
+
+async def launch_detached_command(
+    context: SandboxContext,
+    command: str,
+    *,
+    run_id: str,
+    worktree_path: str,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Launch a harness command detached inside the sandbox under `.sonar/runs/{run_id}/`."""
+    run_dir = f"/workspace/.sonar/runs/{run_id}"
+    script = (
+        f"mkdir -p {shlex.quote(run_dir)} {shlex.quote(worktree_path)} && "
+        f"cd {shlex.quote(worktree_path)} && "
+        f'echo \'{{"state":"running","started_at":\'$(date +%s)\'}}\' > {shlex.quote(run_dir)}/status.json && '
+        f"(setsid {command} > {shlex.quote(run_dir)}/stdout.jsonl 2> {shlex.quote(run_dir)}/stderr.log; "
+        f'EC=$?; echo "{{\\"state\\":\\"completed\\",\\"exit_code\\":$EC,\\"ended_at\\":$(date +%s)}}" > {shlex.quote(run_dir)}/status.json) & '
+        f"PID=$!; echo $PID > {shlex.quote(run_dir)}/pid"
+    )
+    result = await exec_in_sandbox(context, script, env=env, timeout_s=15.0)
+    return {
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "worktree_path": worktree_path,
+        "exit_code": result.exit_code,
+        "error": result.error,
+    }
+
+
+async def poll_detached_command(
+    context: SandboxContext,
+    run_handle: dict[str, Any],
+    *,
+    offset: int = 0,
+) -> tuple[dict[str, Any], str, int]:
+    """Polls status.json and tails new stdout.jsonl bytes past `offset`."""
+    import json
+
+    run_dir = run_handle.get("run_dir") or f"/workspace/.sonar/runs/{run_handle.get('run_id')}"
+    script = (
+        f"cat {shlex.quote(run_dir)}/status.json 2>/dev/null || echo '{{\"state\":\"running\"}}'; "
+        f'echo ""; echo "---STATUS_DELIMITER---"; '
+        f"tail -c +{offset + 1} {shlex.quote(run_dir)}/stdout.jsonl 2>/dev/null || true"
+    )
+    res = await exec_in_sandbox(context, script, timeout_s=15.0)
+    raw = res.stdout or ""
+    parts = raw.split("---STATUS_DELIMITER---", 1)
+    status_json_str = parts[0].strip() if parts else "{}"
+    new_stdout = parts[1].lstrip("\n") if len(parts) > 1 else ""
+
+    try:
+        status_data = json.loads(status_json_str) if status_json_str else {"state": "running"}
+    except Exception:
+        status_data = {"state": "running"}
+
+    new_offset = offset + len(new_stdout.encode("utf-8"))
+    return status_data, new_stdout, new_offset
+
+
+async def cancel_detached_command(
+    context: SandboxContext,
+    run_handle: dict[str, Any],
+) -> bool:
+    """Cancels a detached harness execution by terminating its process group."""
+    run_dir = run_handle.get("run_dir") or f"/workspace/.sonar/runs/{run_handle.get('run_id')}"
+    script = (
+        f"PID=$(cat {shlex.quote(run_dir)}/pid 2>/dev/null); "
+        f'if [ -n "$PID" ]; then '
+        f'  kill -TERM -"$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true; '
+        f"  sleep 0.2; "
+        f'  kill -KILL -"$PID" 2>/dev/null || kill -KILL "$PID" 2>/dev/null || true; '
+        f'  echo \'{{"state":"cancelled","exit_code":-1}}\' > {shlex.quote(run_dir)}/status.json; '
+        f"fi"
+    )
+    res = await exec_in_sandbox(context, script, timeout_s=10.0)
+    return res.ok
+
+
+def _collect_worktree_changes_sync(
+    worktree_path: str | Path,
+) -> tuple[list[str], str, str]:
+    """Blocking implementation of :func:`collect_worktree_changes`."""
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return ([], "", "")
+
+    if (wt / ".git").exists():
+        # Mark untracked files intent-to-add so `git diff` reports their contents
+        # and line counts. This only touches the index, never the working tree.
+        subprocess.run(
+            ["git", "-C", str(wt), "add", "-A", "-N"],
+            check=False,
+            capture_output=True,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(wt), "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if status.returncode == 0:
+            files: list[str] = []
+            for line in status.stdout.splitlines():
+                entry = line[2:].strip() if len(line) > 2 else ""
+                if " -> " in entry:  # renames report "old -> new"
+                    entry = entry.split(" -> ", 1)[1]
+                if entry:
+                    files.append(entry.strip('"'))
+
+            if not files:
+                return ([], "", "")
+
+            raw_diff = subprocess.run(
+                ["git", "-C", str(wt), "diff", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout
+            numstat = subprocess.run(
+                ["git", "-C", str(wt), "diff", "--numstat", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+            added = deleted = 0
+            for row in numstat.splitlines():
+                cols = row.split("\t")
+                if len(cols) >= 2:
+                    if cols[0].isdigit():
+                        added += int(cols[0])
+                    if cols[1].isdigit():
+                        deleted += int(cols[1])
+
+            summary = (
+                f"{len(files)} file(s) changed (+{added} -{deleted}) "
+                f"in {wt.name}."
+            )
+            return (sorted(files), summary, raw_diff)
+
+    # No git metadata (ORCHESTRATOR_DISABLE_HOST_GIT, or an uninitialized worktree).
+    # Fall back to a baseline file-set comparison and say so, rather than inventing a diff.
+    baseline: set[str] = set()
+    meta_file = wt / ".orchestrator_repo.json"
+    if meta_file.exists():
+        try:
+            baseline = set(json.loads(meta_file.read_text()).get("baseline_files", []))
+        except Exception:
+            baseline = set()
+
+    current = {
+        str(f.relative_to(wt))
+        for f in wt.rglob("*")
+        if f.is_file() and not f.name.startswith(".") and ".worktrees" not in f.parts
+    }
+    new_files = sorted(current - baseline)
+    if not new_files:
+        return ([], "", "")
+    summary = (
+        f"{len(new_files)} file(s) changed in {wt.name} "
+        "(no git metadata available, so line counts are unavailable)."
+    )
+    return (new_files, summary, "")
+
+
+async def _collect_sandbox_worktree_changes(
+    context: SandboxContext,
+    worktree_path: str,
+) -> tuple[list[str], str, str]:
+    """Derive `(files_changed, diff_summary, raw_diff)` directly from a worktree inside the Vertex Sandbox."""
+    cmd = (
+        f"cd {shlex.quote(worktree_path)} 2>/dev/null && "
+        "git add -A -N >/dev/null 2>&1 && "
+        "git status --porcelain 2>/dev/null && echo '---NUMSTAT---' && "
+        "git diff --numstat HEAD 2>/dev/null && echo '---DIFF---' && "
+        "git diff HEAD 2>/dev/null"
+    )
+    res = await exec_in_sandbox(context, cmd, timeout_s=30.0)
+    if res.exit_code != 0 or not res.stdout:
+        return ([], "", "")
+
+    parts = res.stdout.split("---DIFF---", 1)
+    raw_diff = parts[1].strip() if len(parts) > 1 else ""
+    header_parts = parts[0].split("---NUMSTAT---", 1)
+    status_text = header_parts[0].strip()
+    numstat_text = header_parts[1].strip() if len(header_parts) > 1 else ""
+
+    files: list[str] = []
+    for line in status_text.splitlines():
+        entry = line[2:].strip() if len(line) > 2 else ""
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        if entry:
+            files.append(entry.strip('"'))
+
+    if not files:
+        return ([], "", "")
+
+    added = deleted = 0
+    for row in numstat_text.splitlines():
+        cols = row.split("\t")
+        if len(cols) >= 2:
+            if cols[0].isdigit():
+                added += int(cols[0])
+            if cols[1].isdigit():
+                deleted += int(cols[1])
+
+    wt_name = worktree_path.rstrip("/").split("/")[-1]
+    summary = f"{len(files)} file(s) changed (+{added} -{deleted}) in {wt_name}."
+    return (sorted(files), summary, raw_diff)
+
+
+async def collect_worktree_changes(
+    worktree_path: str | Path,
+    context: SandboxContext | None = None,
+) -> tuple[list[str], str, str]:
+    """Derive `(files_changed, diff_summary, raw_diff)` from real state in a worktree.
+
+    If a SandboxContext is provided and worktree_path is inside the sandbox (/workspace),
+    changes are inspected inside the remote container via `/exec`. Otherwise, runs
+    against the local host filesystem.
+    """
+    if context is not None and str(worktree_path).startswith("/workspace"):
+        return await _collect_sandbox_worktree_changes(context, str(worktree_path))
+    return await asyncio.to_thread(_collect_worktree_changes_sync, worktree_path)
+
+
 
 
 @runtime_checkable
@@ -286,7 +634,6 @@ def _merge_repo_lists(
 
 def load_workspaces_manifest(local_override_path: Path | None = None) -> dict[str, Any]:
     """Load `config/workspaces.yaml` and deep-merge `config/workspaces.local.yaml` (personal forks, branches, packages)."""
-    import os
     import yaml
 
     config_dir = Path(__file__).resolve().parents[3] / "config"
@@ -416,6 +763,16 @@ def sync_cross_harness_context(target_dir: Path, repo_name: str) -> None:
             pass
 
 
+def _repo_slug(repo: str) -> str:
+    """Normalize a repo name to its on-disk workspace directory name."""
+    return (
+        (repo if repo and repo != "current" else "default-repo")
+        .strip()
+        .lower()
+        .replace(" ", "-")
+    )
+
+
 def ensure_repo_and_worktree(repo: str, task_id: str) -> tuple[Path, Path, str]:
     """Ensure base git repository exists (seeding from config/workspaces.yaml if declared) and create an isolated per-task git worktree on branch `agent/{task_id}`.
 
@@ -423,12 +780,7 @@ def ensure_repo_and_worktree(repo: str, task_id: str) -> tuple[Path, Path, str]:
         (repo_dir, worktree_dir, branch_name)
     """
     root = get_workspace_root()
-    slug = (
-        (repo if repo and repo != "current" else "default-repo")
-        .strip()
-        .lower()
-        .replace(" ", "-")
-    )
+    slug = _repo_slug(repo)
     repo_dir = root / slug
     repo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -453,9 +805,6 @@ def ensure_repo_and_worktree(repo: str, task_id: str) -> tuple[Path, Path, str]:
     readme = repo_dir / "README.md"
     if not readme.exists():
         readme.write_text(f"# {slug}\n")
-
-    import os
-    import shutil
 
     disable_git = os.getenv("ORCHESTRATOR_DISABLE_HOST_GIT", "").lower() in {"1", "true", "yes"}
 
@@ -557,20 +906,50 @@ def ensure_repo_and_worktree(repo: str, task_id: str) -> tuple[Path, Path, str]:
     worktree_dir = worktrees_root / task_id
 
     if not worktree_dir.exists():
+        # A stale registration from a previously removed worktree makes
+        # `worktree add` fail outright, so clear those first.
         subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_dir),
-                "worktree",
-                "add",
-                "-B",
-                branch_name,
-                str(worktree_dir),
-            ],
+            ["git", "-C", str(repo_dir), "worktree", "prune"],
             check=False,
             capture_output=True,
         )
+        branch_exists = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_dir),
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch_name}",
+                ],
+                check=False,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+        # `-B` resets the branch to HEAD. Using it on a branch that already
+        # exists would discard commits from an earlier run of this same task,
+        # so only create the branch when it is genuinely new.
+        add_args = (
+            ["worktree", "add", str(worktree_dir), branch_name]
+            if branch_exists
+            else ["worktree", "add", "-B", branch_name, str(worktree_dir)]
+        )
+        added = subprocess.run(
+            ["git", "-C", str(repo_dir), *add_args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if added.returncode != 0:
+            logger.error(
+                "git worktree add failed for %s (%s): %s",
+                worktree_dir,
+                branch_name,
+                added.stderr.strip() or "unknown error",
+            )
 
     if worktree_dir.exists():
         sync_cross_harness_context(worktree_dir, slug)
@@ -578,38 +957,68 @@ def ensure_repo_and_worktree(repo: str, task_id: str) -> tuple[Path, Path, str]:
     return repo_dir, worktree_dir, branch_name
 
 
-def materialize_workspace_output(
-    repo: str, task_id: str, goal: str, harness_name: str
-) -> tuple[list[str], str, str, str, str]:
-    """Write a task output artifact into both the isolated per-task worktree and base repo directory.
+def release_worktree(repo: str, task_id: str) -> bool:
+    """Remove a task's worktree checkout, leaving its branch and commits intact.
+
+    The counterpart to :func:`ensure_repo_and_worktree`. Without it nothing ever
+    reclaims these: each dispatch creates `.worktrees/<repo>/<task_id>` plus a
+    branch `agent/<task_id>`, and a long-lived process accumulates one per task
+    indefinitely.
+
+    Only the working copy is deleted. `git worktree remove` leaves the branch
+    ref and every commit on it in the base repository, so work that was
+    committed at the approval gate survives and stays available for a PR.
 
     Returns:
-        (files_changed, branch_name, worktree_path, diff_summary, raw_diff)
+        True if a worktree was removed. Never raises; cleanup failing must not
+        fail the task it belongs to.
     """
-    if not repo or repo == "current":
-        return ([], f"agent/{task_id}", f"/workspace/.worktrees/{task_id}", "", "")
+    try:
+        root = get_workspace_root()
+        slug = _repo_slug(repo)
+        repo_dir = root / slug
+        worktree_dir = root / ".worktrees" / slug / task_id
 
-    repo_dir, worktree_dir, branch_name = ensure_repo_and_worktree(repo, task_id)
-    safe_task = task_id.replace("-", "_")
-    out_file = f"{safe_task}_output.py"
-    code_content = (
-        f'"""Generated by {harness_name} for {task_id}: {goal}"""\n\n'
-        f"def run_{safe_task}() -> str:\n"
-        f'    return "completed by {harness_name} on branch {branch_name}"\n'
-    )
+        if not worktree_dir.exists():
+            return False
 
-    target_dir = worktree_dir if worktree_dir.exists() else repo_dir
-    (target_dir / out_file).write_text(code_content)
-    # Mirror to repo_dir so inspect_repository_files(repo) sees completed task outputs
-    (repo_dir / out_file).write_text(code_content)
+        if not (repo_dir / ".git").is_dir():
+            # ORCHESTRATOR_DISABLE_HOST_GIT: the "worktree" is a plain copy with
+            # no registration to clean up.
+            shutil.rmtree(worktree_dir, ignore_errors=True)
+            return True
 
-    diff_summary = f"1 file changed ({out_file}: +4 -0) on branch {branch_name}; unit tests passed."
-    raw_diff = (
-        f"diff --git a/{out_file} b/{out_file}\n"
-        f"new file mode 100644\n"
-        f"--- /dev/null\n"
-        f"+++ b/{out_file}\n"
-        f"@@ -0,0 +1,4 @@\n"
-        + "\n".join(f"+{line}" for line in code_content.strip().splitlines())
-    )
-    return ([out_file], branch_name, str(target_dir), diff_summary, raw_diff)
+        removed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree_dir),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if removed.returncode != 0:
+            logger.warning(
+                "git worktree remove failed for %s: %s",
+                worktree_dir,
+                removed.stderr.strip() or "unknown error",
+            )
+            shutil.rmtree(worktree_dir, ignore_errors=True)
+
+        # Drop any registration now pointing at a directory that is gone.
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "prune"],
+            check=False,
+            capture_output=True,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Worktree cleanup failed for %s/%s: %s", repo, task_id, exc)
+        return False
+
+
