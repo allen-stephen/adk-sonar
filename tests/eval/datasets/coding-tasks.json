@@ -23,6 +23,17 @@
       }
     },
     {
+      "eval_case_id": "route_coding_harness_dispatch",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Dispatch a task in plan mode on auth-svc using Claude Code to refactor the Redis session store."
+          }
+        ]
+      }
+    },
+    {
       "eval_case_id": "plan_question_and_steer",
       "agent_data": {
         "agents": {
@@ -142,105 +153,6 @@
                 }
               }
             ]
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_spotify_music",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Put on my deep focus electronic coding playlist on Spotify while I review these diffs."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_google_search_realtime",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "What are the latest breaking announcements from the Python 3.13 release notes on the web right now?"
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_google_maps_places",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Find a quiet coffee shop with good Wi-Fi near downtown Austin that is open right now."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_calendar_schedule",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Check my Google Calendar for today and tell me when my next free focus block is."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_gmail_inbox",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Check my unread Gmail messages and tell me if Alex sent an update on the auth service rollout."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_drive_docs",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Search my Google Drive for the token rotation PRD and tell me what grace window it specifies."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_slack_channel",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Check the eng-alerts channel on Slack and tell me if the staging canary passed."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_github_pr_status",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Check the GitHub CI status on the latest pull request for auth-svc."
-          }
-        ]
-      }
-    },
-    {
-      "eval_case_id": "route_coding_harness_dispatch",
-      "prompt": {
-        "role": "user",
-        "parts": [
-          {
-            "text": "Dispatch a task in plan mode on auth-svc using Claude Code to refactor the Redis session store."
           }
         ]
       }

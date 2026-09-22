@@ -9,28 +9,28 @@ from app.workers.harnesses.base import CodingHarness
 from app.workers.harnesses.claude import ClaudeCodeHarness
 from app.workers.harnesses.horizon import HorizonA2AHarness
 
+_BUILTIN_ALIASES: dict[str, str] = {
+    "claude": "claude",
+    "claude-code": "claude",
+    "claude_code": "claude",
+    "claudecode": "claude",
+    "horizon": "horizon",
+    "long-horizon": "horizon",
+    "long_horizon": "horizon",
+    "long-horizon-harness": "horizon",
+    "long_horizon_harness": "horizon",
+    "adk": "horizon",
+    "adk-horizon": "horizon",
+    "antigravity": "antigravity",
+    "agy": "antigravity",
+    "gemini": "antigravity",
+    "gemini-cli": "antigravity",
+    "gemini_cli": "antigravity",
+}
+
 
 class HarnessRegistry:
     """Registry of available coding harnesses and active default selection."""
-
-    _ALIASES: dict[str, str] = {
-        "claude": "claude",
-        "claude-code": "claude",
-        "claude_code": "claude",
-        "claudecode": "claude",
-        "horizon": "horizon",
-        "long-horizon": "horizon",
-        "long_horizon": "horizon",
-        "long-horizon-harness": "horizon",
-        "long_horizon_harness": "horizon",
-        "adk": "horizon",
-        "adk-horizon": "horizon",
-        "antigravity": "antigravity",
-        "agy": "antigravity",
-        "gemini": "antigravity",
-        "gemini-cli": "antigravity",
-        "gemini_cli": "antigravity",
-    }
 
     def __init__(self) -> None:
         self._harnesses: dict[str, CodingHarness] = {
@@ -38,6 +38,9 @@ class HarnessRegistry:
             "antigravity": AntigravityHarness(),
             "claude": ClaudeCodeHarness(),
         }
+        # Copied per instance so `register_harness` cannot leak aliases into
+        # class state and survive `reset_harness_registry()`.
+        self._aliases: dict[str, str] = dict(_BUILTIN_ALIASES)
         env_default = os.getenv("CODING_HARNESS", "horizon")
         self._default_name = self.normalize_name(env_default) or "horizon"
 
@@ -47,16 +50,16 @@ class HarnessRegistry:
         cleaned = name.strip().lower().replace(" ", "-")
         if cleaned in self._harnesses:
             return cleaned
-        return self._ALIASES.get(cleaned)
+        return self._aliases.get(cleaned)
 
     def register_harness(
         self, harness: CodingHarness, aliases: list[str] | None = None
     ) -> None:
         key = harness.name.strip().lower()
         self._harnesses[key] = harness
-        self._ALIASES[key] = key
+        self._aliases[key] = key
         for alias in aliases or []:
-            self._ALIASES[alias.strip().lower()] = key
+            self._aliases[alias.strip().lower()] = key
 
     def get(self, name: str | None = None) -> CodingHarness:
         """Return the requested harness, or the active default if name is None."""

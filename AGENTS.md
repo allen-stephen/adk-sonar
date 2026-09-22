@@ -19,11 +19,11 @@ Voice agents break down when asked to perform real engineering or productivity w
 
 **ADK Sonar** solves these challenges with six composable interfaces on top of Google ADK (`Runner.run_live()`):
 
-1. **Non-Blocking Live Voice Tool Wrapper (`@non_blocking_tool`)** — Wraps any async tool (`app/tools/async_wrapper.py`) so it immediately yields `{status: "RUNNING", task_id: ...}` to the Gemini Live stream, registers the coroutine in an `AsyncTaskRegistry`, and injects the completion event alongside a `WHEN_IDLE` scheduling hint so the voice persona narrates results at the next natural pause.
-2. **Pluggable Multi-Harness Sandbox Protocol (`CodingHarness` + `SandboxProvisioner`)** — Executes background coding tasks inside a persistent **Vertex AI Agent Engine Sandbox** container (`app/workers/sandbox.py`) through a unified `CodingHarness` interface (`app/workers/harnesses.py`) supporting **ADK Long-Horizon** (`horizon`), **Antigravity CLI** (`antigravity`), and **Claude Code** (`claude`).
-3. **Two-Phase Plan → Execute with Git Worktree Isolation & Mid-Task Handoff (`TaskWorker`)** — Isolates every background task in its own git worktree (`workspaces/<repo>/.worktrees/<task_id>`), gates code changes behind a `PLAN.md` approval step (`mode="plan"` → `approve_and_execute`), and allows mid-task harness switching (`switch_harness`) because `PLAN.md`, `PROGRESS.md`, and commits persist in the shared worktree.
-4. **Scoped A2UI v0.9 Surface Deck (`a2ui_emitter` + `A2UISurfaceDeck`)** — Maps every tool execution and background task transition to a single active **A2UI v0.9** visual surface (`TaskStatusCard`, `PlanReviewCard`, `GitHubPRCard`, `WorkspaceDigestCard`, `CalendarAgendaCard`, `SpotifyPlayerCard`, `PlaceCard`) pushed over WebSockets alongside PCM audio.
-5. **Declarative OAuth 2.0 + ADC Workspace Bridge (`IntegrationAuthManager`)** — Centralizes authentication (`config/integrations.yaml` + `app/auth.py`) with OAuth 2.0 + PKCE + automatic refresh-token rotation (`SPOTIFY_REFRESH_TOKEN`, `GOOGLE_WORKSPACE_REFRESH_TOKEN`), 1-click `gcloud` ADC scope expansion with `X-Goog-User-Project` quota headers, and dynamic GitHub `@me` fork resolution.
+1. **Non-Blocking Live Voice Tool Wrapper (`non_blocking_tool`)** — Wraps any async tool ([`app/agent.py`](app/agent.py)) as an async generator so it immediately returns pending status to the Gemini Live stream, executes the coroutine in the background, and injects the completion event alongside a `WHEN_IDLE` scheduling hint so the voice persona narrates results at the next natural pause.
+2. **Pluggable Multi-Harness Sandbox Protocol (`CodingHarness` + `SandboxProvisioner`)** — Executes background coding tasks inside a persistent **Vertex AI Agent Engine Sandbox** container ([`app/workers/sandbox.py`](app/workers/sandbox.py)) through a unified `CodingHarness` protocol ([`app/workers/harnesses/base.py`](app/workers/harnesses/base.py)) supporting **ADK Long-Horizon** (`horizon`), **Antigravity CLI** (`antigravity`), and **Claude Code** (`claude`).
+3. **Two-Phase Plan → Execute with Git Worktree Isolation & Mid-Task Handoff (`TaskRegistry` + `TaskStore`)** — Isolates every background task in its own git worktree (`.worktrees/<repo>/<task_id>`), gates code changes behind plan/diff approval checkpoints (`mode="plan"` / `require_approval=True`), persists state in a durable SQLite/Postgres ledger ([`app/store/task_store.py`](app/store/task_store.py)), and allows mid-task harness switching (`steer_task(harness=...)`) on the shared worktree.
+4. **Scoped A2UI v0.9 Surface Deck (`_build_a2ui_surfaces` + `A2UISurfaceDeck`)** — Maps every tool execution and background task transition to a single active **A2UI v0.9** visual surface (`plan_approval`, `task_trajectory`, `task_outcome`, `context_card`) rendered alongside real-time audio.
+5. **Declarative OAuth 2.0 + ADC Workspace Bridge (`app/auth.py`)** — Centralizes authentication (`config/integrations.yaml` + `app/auth.py`) with OAuth 2.0 + PKCE + automatic refresh-token rotation (`SPOTIFY_REFRESH_TOKEN`, `GOOGLE_WORKSPACE_REFRESH_TOKEN`), 1-click `gcloud` ADC scope expansion with `X-Goog-User-Project` quota headers, and dynamic GitHub `@me` fork resolution.
 6. **Human + AI-Agent Dual-Mode Onboarding (`provision_sandbox.py`)** — Provides both a guided 5-minute interactive CLI wizard (`make onboard`) and a deterministic, zero-prompt `--non-interactive` mode for coding agents to provision Vertex sandboxes, clone forks, and verify integrations (`make check`).
 
 ---
@@ -32,21 +32,21 @@ Voice agents break down when asked to perform real engineering or productivity w
 
 | # | Interface | Start here (file → symbol) | What to look for | How to lift into your own agent |
 |---|---|---|---|---|
-| 1 | **Non-blocking Live Voice tool dispatch (`WHEN_IDLE`)** | [`app/tools/async_wrapper.py`](app/tools/async_wrapper.py) → `non_blocking_tool()`, `AsyncTaskRegistry` | How the wrapper spawns an `asyncio.Task`, returns `{status: "RUNNING"}` in `<5ms`, and fires `on_task_complete` with `"scheduling": "WHEN_IDLE"` when finished. | Copy `app/tools/async_wrapper.py` and decorate any slow API or sub-agent tool with `@non_blocking_tool` so `Runner.run_live()` never stalls audio. |
-| 2 | **Bidirectional WebSocket voice + event multiplexer** | [`app/main.py`](app/main.py) → `websocket_endpoint()`, `_forward_adk_events()` | How binary PCM 16kHz microphone frames feed `LiveRequestQueue.send_realtime()`, while ADK audio chunks, transcripts, and A2UI JSON cards multiplex onto a single WebSocket. | Reuse the `LiveRequestQueue` + `RunConfig(response_modalities=["AUDIO"])` loop in `app/main.py` for any custom web/mobile voice client. |
-| 3 | **Vertex AI Agent Engine Sandbox provisioner & executor** | [`app/workers/sandbox.py`](app/workers/sandbox.py) → `SandboxProvisioner.ensure_sandbox()`, `execute_command()` | How `sandboxEnvironments` are created under a parent `ReasoningEngine`, signed with a JWT (`iam.credentials.signJwt`), and sent shell commands over HTTPS (`/execute`). | Copy `SandboxProvisioner` from `app/workers/sandbox.py` and `scripts/provision_sandbox.py` to give any agent isolated remote Linux execution. |
-| 4 | **Interchangeable Coding Harnesses (`horizon`, `antigravity`, `claude`)** | [`app/workers/harnesses.py`](app/workers/harnesses.py) → `CodingHarness`, `HorizonHarness`, `AntigravityHarness`, `ClaudeCodeHarness` | How all three harnesses implement `execute(instruction, workspace_path, sandbox_id, mode, prior_context)` and read/write `PLAN.md` and `PROGRESS.md` inside the sandbox worktree. | Implement a new subclass of `CodingHarness` in `app/workers/harnesses.py` and register it in `HARNESS_REGISTRY` to add another CLI agent (e.g., Gemini CLI, Aider, Codex). |
-| 5 | **Git worktree isolation, Plan gate & mid-task harness switch** | [`app/workers/task_worker.py`](app/workers/task_worker.py) → `TaskWorker.dispatch_task()`, `approve_and_execute()`, `switch_harness()` | How `git worktree add -B task/<id>` isolates each run, how `mode="plan"` pauses at `awaiting_approval`, and how `switch_harness()` passes `PLAN.md` + `git status` to the new harness. | Lift `TaskWorker` whenever you want human-in-the-loop plan approval and hot-swappable worker backends over a shared git repo. |
-| 6 | **Scoped A2UI v0.9 visual surface emitter** | [`app/callbacks/a2ui_emitter.py`](app/callbacks/a2ui_emitter.py) → `emit_surface_for_tool()` & [`web/src/components/a2ui/A2UISurfaceDeck.tsx`](web/src/components/a2ui/A2UISurfaceDeck.tsx) | How tool outputs are translated into A2UI v0.9 payloads (`createSurface`, `updateComponents`, `updateDataModel`) and rendered as interactive mobile cards. | Add a surface builder in `app/callbacks/a2ui_emitter.py` and a matching card component in `A2UISurfaceDeck.tsx` for your own domain entities. |
-| 7 | **Declarative OAuth 2.0 + PKCE + Refresh Token & ADC bridge** | [`config/integrations.yaml`](config/integrations.yaml) & [`app/auth.py`](app/auth.py) → `IntegrationAuthManager` | How OAuth flows dynamically resolve local (`127.0.0.1:8000`) vs Cloud Run (`APP_URL`) callbacks, auto-rotate refresh tokens, and attach `X-Goog-User-Project` headers to ADC tokens. | Add a new block to `config/integrations.yaml` and call `auth_manager.get_token("<id>")` inside your tool function. |
+| 1 | **Non-blocking Live Voice tool dispatch (`WHEN_IDLE`)** | [`app/agent.py`](app/agent.py) → `non_blocking_tool()` | How the wrapper converts an async function into an async generator, returns immediate pending status, and schedules completion with `WHEN_IDLE`. | Wrap slow tools with `non_blocking_tool()` so `Runner.run_live()` never stalls the audio stream. |
+| 2 | **ADK Live FastAPI server & Lifespan** | [`app/fast_api_app.py`](app/fast_api_app.py) → `get_fast_api_app()`, `lifespan` | How ADK mounts the `/run_live` WebSocket alongside custom UI control-plane routes (`app/api_routes.py`). | Use `get_fast_api_app(web=True, lifespan=lifespan)` to serve both native Gemini Live audio and custom application APIs. |
+| 3 | **Vertex AI Agent Engine Sandbox provisioner & executor** | [`app/workers/sandbox.py`](app/workers/sandbox.py) → `SandboxWorker._ensure_sandbox()` & [`app/workers/harnesses/base.py`](app/workers/harnesses/base.py) → `exec_in_sandbox()` | How `sandboxEnvironments` are created under a parent `ReasoningEngine`, signed with a JWT (`iam.credentials.signJwt`), probed dynamically, and sent shell commands over HTTPS (`/exec`). | Copy `SandboxWorker` + `SandboxProvisioner` (`app/workers/harnesses/provisioner.py`) to give any agent isolated remote Linux execution. |
+| 4 | **Interchangeable Coding Harnesses (`horizon`, `antigravity`, `claude`)** | [`app/workers/harnesses/`](app/workers/harnesses/) → `CodingHarness`, `HorizonA2AHarness`, `AntigravityHarness`, `ClaudeCodeHarness` | How harnesses implement the `CodingHarness` protocol in `app/workers/harnesses/base.py` and register via `get_harness_registry()`. | Implement a new subclass of `CodingHarness` in `app/workers/harnesses/` and register it in `HarnessRegistry` to add another agent CLI. |
+| 5 | **Git worktree isolation, Plan gate & task tracking** | [`app/tasks/registry.py`](app/tasks/registry.py) → `TaskRegistry`, [`app/store/task_store.py`](app/store/task_store.py) → `TaskStore` & [`app/tools/task_tools.py`](app/tools/task_tools.py) → `dispatch_task()`, `approve_task()`, `steer_task()` | How git worktrees isolate each task branch (`agent/<task_id>`), how `mode="plan"` pauses at `awaiting_input` or `awaiting_approval`, and how steering resumes execution. | Use per-task git worktrees and approval checkpoints for human-in-the-loop validation over codebases. |
+| 6 | **Scoped A2UI v0.9 visual surface builder** | [`app/api_routes.py`](app/api_routes.py) → `_build_a2ui_surfaces()` & [`web/src/components/a2ui/A2UISurfaceDeck.tsx`](web/src/components/a2ui/A2UISurfaceDeck.tsx) | How task states are translated into A2UI v0.9 surface payloads (`plan_approval`, `task_trajectory`, `task_outcome`, `context_card`) and rendered in React. | Generate declarative A2UI JSON structures and map them to interactive mobile cards. |
+| 7 | **Declarative OAuth 2.0 + PKCE + Refresh Token & ADC bridge** | [`config/integrations.yaml`](config/integrations.yaml) & [`app/auth.py`](app/auth.py) → `ensure_fresh_access_token()`, `exchange_oauth_code()` | How OAuth flows dynamically resolve local (`127.0.0.1:8000`) vs Cloud Run (`APP_URL`) callbacks, auto-rotate refresh tokens, and attach `X-Goog-User-Project` headers to ADC tokens. | Add a new block to `config/integrations.yaml` and call `ensure_fresh_access_token("<id>")` inside your tool function. |
 
 ---
 
 ## Beyond the core interfaces
 
 - **Dynamic personal fork discovery (`@me`)** — [`app/tools/integration_tools.py`](app/tools/integration_tools.py) (`github_operations`) queries `GET /user` with your `GH_TOKEN` at runtime to inspect both upstream repositories and your personal forks (`<authenticated_user>/<repo>`) plus authored PRs (`author:<authenticated_user>`) with zero hardcoded usernames.
-- **Strict separation of live vs evaluation fixtures** — All tool functions in [`app/tools/integration_tools.py`](app/tools/integration_tools.py) gate deterministic test fixtures behind `_is_test_or_eval_mode()` (`PYTEST_CURRENT_TEST` or `ADK_EVAL_MODE`), ensuring live voice sessions always hit real APIs or return actionable remediation cards.
-- **Context caching & state synchronization** — [`app/callbacks/context_sync.py`](app/callbacks/context_sync.py) injects active task statuses, recent git branches, and connected app readiness into the ADK session state before each model turn without bloating the voice prompt.
+- **Zero-test-code production purity (`tests/fakes.py` + `httpx.MockTransport`)** — Production modules under `app/` contain zero test-mode branches (`PYTEST_CURRENT_TEST`, `ADK_EVAL_MODE`) or canned fallback payloads. All test doubles (`FakeHarness`, `exec_transport`, `a2a_transport`, `integrations_transport`) live strictly under `tests/fakes.py` and are injected at the HTTP transport and harness registry boundaries.
+- **Async TaskStore hydration & situational briefing** — [`app/agent.py`](app/agent.py) (`build_orchestrator_instruction`) asynchronously hydrates active and recently completed tasks from `TaskStore` (`await get_task_registry().list_all()`) before each session turn without bloating the voice prompt.
 
 ---
 
@@ -54,12 +54,11 @@ Voice agents break down when asked to perform real engineering or productivity w
 
 If you are reading the codebase from scratch, follow this path (~20 minutes):
 
-1. **[`app/agent.py`](app/agent.py)** — Read `SYSTEM_INSTRUCTION` and `root_agent` to see the 13 registered tools and how the voice persona (`Charon`) separates spoken brevity from visual A2UI rendering.
-2. **[`app/tools/async_wrapper.py`](app/tools/async_wrapper.py)** — See how `@non_blocking_tool` decouples slow tool execution from the real-time Gemini Live audio loop.
-3. **[`app/workers/sandbox.py`](app/workers/sandbox.py) & [`app/workers/harnesses.py`](app/workers/harnesses.py)** — See how commands execute remotely inside the Vertex AI Agent Engine Sandbox across `horizon`, `antigravity`, and `claude`.
-4. **[`app/workers/task_worker.py`](app/workers/task_worker.py)** — Trace a task from `dispatch_task(mode="plan")` → `awaiting_approval` → `approve_and_execute()` or `switch_harness()`.
-5. **[`app/auth.py`](app/auth.py) & [`config/integrations.yaml`](config/integrations.yaml)** — See how OAuth 2.0 PKCE, refresh tokens, and `gcloud` ADC tokens are managed and persisted.
-6. **[`web/src/App.tsx`](web/src/App.tsx) & [`web/src/components/a2ui/A2UISurfaceDeck.tsx`](web/src/components/a2ui/A2UISurfaceDeck.tsx)** — See how the React frontend renders the active A2UI surface card alongside the bottom control sheets.
+1. **[`app/agent.py`](app/agent.py)** — Read `build_orchestrator_instruction`, `non_blocking_tool`, and `root_agent` to see how the voice orchestrator separates spoken brevity from visual A2UI rendering.
+2. **[`app/workers/sandbox.py`](app/workers/sandbox.py) & [`app/workers/harnesses/`](app/workers/harnesses/)** — See how commands execute remotely inside the Vertex AI Agent Engine Sandbox across `horizon`, `antigravity`, and `claude`.
+3. **[`app/tasks/registry.py`](app/tasks/registry.py) & [`app/store/task_store.py`](app/store/task_store.py)** — Trace a task from `dispatch_task(mode="plan")` → `awaiting_input` / `awaiting_approval` → `approve_task()` or `steer_task()`.
+4. **[`app/auth.py`](app/auth.py) & [`config/integrations.yaml`](config/integrations.yaml)** — See how OAuth 2.0 PKCE, refresh tokens, and `gcloud` ADC tokens are managed and persisted.
+5. **[`web/src/App.tsx`](web/src/App.tsx) & [`web/src/components/a2ui/A2UISurfaceDeck.tsx`](web/src/components/a2ui/A2UISurfaceDeck.tsx)** — See how the React frontend renders the active A2UI surface card alongside the bottom control sheets.
 
 ---
 
@@ -70,37 +69,42 @@ If you are reading the codebase from scratch, follow this path (~20 minutes):
 ```text
 adk-sonar/
 ├── app/
-│   ├── agent.py                 # Root ADK Gemini Live agent (`root_agent`) & voice persona instructions
-│   ├── main.py                  # FastAPI entrypoint, WebSocket `/ws/live` audio+A2UI multiplexer, static SPA host
-│   ├── api_routes.py            # REST endpoints (`/api/v1/tasks`, `/api/v1/workspaces`, `/api/v1/integrations`, `/api/v1/auth/*`)
-│   ├── auth.py                  # Unified OAuth 2.0 + PKCE + Refresh Token + CLI ADC manager (`IntegrationAuthManager`)
-│   ├── callbacks/
-│   │   ├── a2ui_emitter.py      # Translates tool outputs & task transitions into A2UI v0.9 surface payloads
-│   │   ├── context_sync.py      # Synchronizes background task & workspace state into ADK session state
-│   │   └── persistence.py       # Session & artifact persistence callbacks
+│   ├── agent.py                 # Root ADK Gemini Live agent (`root_agent`), `non_blocking_tool`, and async instruction
+│   ├── fast_api_app.py          # FastAPI entrypoint, lifespan, native ADK `/run_live` WebSocket, static UI host
+│   ├── api_routes.py            # REST endpoints (`/api/v1/state`, `/api/v1/tasks`, `/api/v1/auth/*`, A2UI surfaces)
+│   ├── auth.py                  # Unified OAuth 2.0 + PKCE + Refresh Token + CLI ADC manager
+│   ├── integrations.py          # Integration registry, specs, and MCP toolset generation
+│   ├── store/                   # Durable SQLAlchemy async TaskStore (`models.py`, `task_store.py`, `reconciler.py`)
+│   ├── tasks/                   # `TaskRegistry`, `TaskHandle`, persistence bridge, and concurrency limits
+│   ├── app_utils/
+│   │   ├── http_client.py       # Shared async HTTP client factory with transport injection seam
+│   │   └── services.py          # ADK session, memory & artifact service factory (`shared://session`, `shared://artifact`)
 │   ├── tools/
-│   │   ├── async_wrapper.py     # `@non_blocking_tool` decorator & `AsyncTaskRegistry` (`WHEN_IDLE` scheduling)
-│   │   ├── coding_tools.py      # `dispatch_coding_task`, `switch_task_harness`, `manage_workspace`, `git_operations`
-│   │   └── integration_tools.py # Live REST tools: Google Workspace, Search, Maps, GitHub, Spotify, Slack
+│   │   ├── grounding_tools.py   # Grounded search (Google Search, Google Maps Places)
+│   │   ├── integration_tools.py # Downstream APIs: Workspace (Calendar, Gmail, Drive), Slack, GitHub, Spotify
+│   │   ├── task_tools.py        # Voice tools: `dispatch_task`, `steer_task`, `approve_task`, `watch_tasks`
+│   │   └── workspace_tools.py   # Repository inspection, cloning, file reading
 │   └── workers/
-│       ├── sandbox.py           # `SandboxProvisioner` for Vertex AI Agent Engine Sandboxes (`sandboxEnvironments`)
-│       ├── harnesses.py         # `HorizonHarness`, `AntigravityHarness`, `ClaudeCodeHarness` implementations
-│       └── task_worker.py       # Git worktree isolation, `PLAN.md` approval gate, and mid-task harness switching
+│       ├── base.py              # `WorkerBackend` protocol & `WorkerExecutionResult`
+│       ├── factory.py           # Worker backend selector (`sandbox` vs `local`)
+│       ├── local.py             # `LocalWorker` subprocess runner
+│       ├── sandbox.py           # `SandboxWorker` (Vertex AI Agent Engine Sandbox `/exec`)
+│       └── harnesses/           # Interchangeable harnesses (`base.py`, `provisioner.py`, `claude.py`, `antigravity.py`, `horizon.py`, `registry.py`)
 ├── config/
 │   ├── integrations.yaml        # Declarative integration metadata, OAuth endpoints, scopes, and setup steps
-│   ├── workspaces.yaml          # Default tracked repository definitions
-│   └── settings.yaml            # Runtime model, voice persona, and sandbox timeout configuration
+│   ├── workspaces.yaml          # Default tracked repositories, demo tasks, and sandbox package manifest
+│   └── workspaces.local.yaml    # Local repository overrides
 ├── scripts/
 │   ├── provision_sandbox.py     # Interactive + `--non-interactive` onboarding wizard & `--check-only` verifier
-│   └── sync_cloud_run_env.py    # Pushes local `.env` secrets & `APP_URL` to Google Cloud Run
+│   └── setup.py                 # Environment verification & installation helper
 ├── web/                         # Mobile-first React + TypeScript + Tailwind + Vite PWA
-│   ├── public/assets/           # Branding assets (`adk-sonar.png`)
-│   └── src/
-│       ├── App.tsx              # Main orchestrator layout, header status pills, and audio visualizer
-│       ├── components/a2ui/     # `A2UISurfaceDeck.tsx` rendering scoped A2UI v0.9 visual cards
-│       └── components/sheets/   # `TasksSheet.tsx`, `WorkspacesSheet.tsx`, `ConnectionsSheet.tsx`, `TranscriptSheet.tsx`
-├── tests/                       # Unit & integration test suites (`pytest`)
-├── Makefile                     # Developer workflow shortcuts (`onboard`, `check`, `sandbox`, `dev`, `test`, `deploy`)
+│   ├── src/
+│   │   ├── App.tsx              # Main orchestrator layout, header status pills, and audio visualizer
+│   │   ├── components/a2ui/     # `A2UISurfaceDeck.tsx` rendering scoped A2UI v0.9 visual cards
+│   │   ├── components/sheets/   # `ConnectionsSheet.tsx`, `FleetTasksSheet.tsx`
+│   │   └── lib/                 # `live-audio-client.ts`, `api.ts`
+├── tests/                       # Unit, integration, eval test suites, and `tests/fakes.py` network/protocol doubles
+├── Makefile                     # Developer workflow shortcuts (`onboard`, `check`, `sandbox`, `dev`, `test`, `eval`, `deploy`)
 └── .env.example                 # Documented environment template
 ```
 

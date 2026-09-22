@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from app.workers.base import WorkerBackend, WorkerExecutionResult
@@ -18,7 +20,12 @@ from app.workers.harnesses import (
     get_coding_harness,
     get_sandbox_provisioner,
 )
-from app.workers.harnesses.base import ensure_repo_and_worktree
+from app.workers.harnesses.base import (
+    _repo_slug,
+    ensure_repo_and_worktree,
+    exec_in_sandbox,
+    load_workspaces_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,30 +47,26 @@ class SandboxWorker(WorkerBackend):
         *,
         project_id: str | None = None,
         location: str | None = None,
-        mock_mode: bool | None = None,
         default_harness: str | None = None,
         provisioner: SandboxProvisioner | None = None,
+        connection: dict[str, str] | None = None,
+        http_transport: Any | None = None,
     ) -> None:
-        self.project_id = project_id or os.getenv(
-            "GOOGLE_CLOUD_PROJECT", "agents-cli-test-dev-qi5zi1"
-        )
+        self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT", "")
         self.location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         self.default_harness = default_harness
         self._provisioner = provisioner
-
-        if mock_mode is None:
-            if os.getenv("PYTEST_CURRENT_TEST"):
-                self.mock_mode = True
-            else:
-                self.mock_mode = os.getenv("MOCK_REMOTE_RUNNER", "false").lower() in {
-                    "true",
-                    "1",
-                    "yes",
-                }
-        else:
-            self.mock_mode = mock_mode
-
+        # Tests supply `connection` + `http_transport` to drive the real harness
+        # code paths without reaching Google Cloud.
+        self._connection = connection
+        self._http_transport = http_transport
         self._running_tasks: dict[str, Any] = {}
+        self._repo_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_repo_lock(self, repo_slug: str) -> asyncio.Lock:
+        if repo_slug not in self._repo_locks:
+            self._repo_locks[repo_slug] = asyncio.Lock()
+        return self._repo_locks[repo_slug]
 
     @property
     def provisioner(self) -> SandboxProvisioner:
@@ -71,30 +74,24 @@ class SandboxWorker(WorkerBackend):
 
     async def _ensure_sandbox(self, user_id: str = "default_user") -> dict[str, str]:
         """Finds or provisions the persistent per-user Vertex Agent Engine Sandbox container."""
-        sandbox_name = f"voice-worker-{user_id}"
-        if self.mock_mode or os.getenv("PYTEST_CURRENT_TEST"):
+        if self._connection is not None:
+            return self._connection
+
+        if os.getenv("VERTEX_SANDBOX_LB_HOST") and os.getenv("VERTEX_SANDBOX_ROUTING_TOKEN"):
             return {
-                "sandbox_name": sandbox_name,
-                "lb_host": "mock-sandbox-lb.aiplatform.googleapis.com",
-                "routing_token": "mock-token",
-                "sandbox_token": "mock-auth",
+                "sandbox_name": os.getenv("VERTEX_SANDBOX_RESOURCE_NAME") or f"voice-worker-{user_id}",
+                "lb_host": os.getenv("VERTEX_SANDBOX_LB_HOST", ""),
+                "routing_token": os.getenv("VERTEX_SANDBOX_ROUTING_TOKEN", ""),
+                "sandbox_token": os.getenv("VERTEX_SANDBOX_TOKEN", ""),
             }
 
-        try:
-            return await asyncio.to_thread(self._resolve_live_vertex_sandbox, user_id)
-        except Exception as exc:
-            logger.warning("Falling back to default sandbox info (%s)", exc)
-            return {
-                "sandbox_name": sandbox_name,
-                "lb_host": f"{self.location}-aiplatform.googleapis.com",
-                "routing_token": "live-token",
-                "sandbox_token": "live-auth",
-            }
+        return await asyncio.to_thread(self._resolve_live_vertex_sandbox, user_id)
 
     def _resolve_live_vertex_sandbox(self, user_id: str = "default_user") -> dict[str, str]:
         """Reattaches to or creates a live Vertex Agent Engine Sandbox in GCP dynamically."""
         import httpx
         import vertexai
+
         from app.auth import persist_env_vars
 
         sb_project = (
@@ -187,6 +184,104 @@ class SandboxWorker(WorkerBackend):
             return harness
         return get_coding_harness(harness or self.default_harness)
 
+    async def _sync_remote_repository_in_sandbox(
+        self,
+        context: SandboxContext,
+        repo: str,
+        task_id: str,
+        branch_name: str,
+    ) -> None:
+        """Fetch latest commits from GitHub and prepare an isolated worktree for the task.
+
+        Uses an asyncio.Lock per repository to serialize the 500ms fetch step
+        across concurrent tasks targeting the same repo, while letting their
+        actual coding executions run in full parallelism.
+        """
+        slug = _repo_slug(repo)
+        lock = self._get_repo_lock(slug)
+        async with lock:
+            manifest = load_workspaces_manifest()
+            repo_spec = next(
+                (
+                    r
+                    for r in manifest.get("repositories", [])
+                    if isinstance(r, dict) and r.get("name") == slug
+                ),
+                None,
+            )
+            git_url = str((repo_spec or {}).get("git_url") or "").strip()
+            default_branch = str((repo_spec or {}).get("branch") or "main").strip()
+
+            token = (
+                os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+                or os.getenv("GH_TOKEN", "").strip()
+            )
+            auth_header = (
+                f'-c http.extraHeader="Authorization: Bearer {token}" '
+                if token
+                else ""
+            )
+
+            disable_remote_git = os.getenv("ORCHESTRATOR_DISABLE_HOST_GIT", "").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            if disable_remote_git or not git_url:
+                setup_cmd = (
+                    f"mkdir -p /workspace/{slug} /workspace/.worktrees && "
+                    f"cd /workspace/{slug} && "
+                    f"([ -d .git ] || (git init -b {default_branch} && "
+                    f"git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"echo '# {slug}' > README.md && git add . && git commit -m 'init')) && "
+                    f"git worktree prune >/dev/null 2>&1 || true; "
+                    f"(git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || "
+                    f"mkdir -p /workspace/.worktrees/{shlex.quote(task_id)})"
+                )
+            else:
+                setup_cmd = (
+                    f"mkdir -p /workspace/{slug} /workspace/.worktrees && "
+                    f"cd /workspace/{slug} && "
+                    f"if [ -d .git ]; then "
+                    f"  (git remote get-url origin >/dev/null 2>&1 || git remote add origin {shlex.quote(git_url)}) && "
+                    f"  git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"  GIT_TERMINAL_PROMPT=0 git {auth_header} fetch --all --prune --quiet 2>/dev/null || true; "
+                    f"else "
+                    f"  git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"  (GIT_TERMINAL_PROMPT=0 git {auth_header} clone --quiet {shlex.quote(git_url)} . 2>/dev/null || "
+                    f"   (git init -b {default_branch} && git remote add origin {shlex.quote(git_url)} && "
+                    f"    GIT_TERMINAL_PROMPT=0 git {auth_header} fetch --all --prune --quiet 2>/dev/null || true)); "
+                    f"fi && "
+                    f"git worktree prune >/dev/null 2>&1 || true; "
+                    f"(git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} origin/{default_branch} >/dev/null 2>&1 || "
+                    f" git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} HEAD >/dev/null 2>&1 || "
+                    f" mkdir -p /workspace/.worktrees/{shlex.quote(task_id)})"
+                )
+
+            await exec_in_sandbox(context, setup_cmd, timeout_s=30.0)
+
+    async def _push_task_branch_to_remote(
+        self,
+        context: SandboxContext,
+        task_id: str,
+        branch_name: str,
+    ) -> None:
+        """Push the completed task's git branch to origin so changes are preserved on GitHub."""
+        token = (
+            os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+            or os.getenv("GH_TOKEN", "").strip()
+        )
+        auth_header = (
+            f'-c http.extraHeader="Authorization: Bearer {token}" '
+            if token
+            else ""
+        )
+        push_cmd = (
+            f"cd /workspace/.worktrees/{shlex.quote(task_id)} 2>/dev/null && "
+            f"GIT_TERMINAL_PROMPT=0 git {auth_header} push -u origin {shlex.quote(branch_name)} --quiet 2>/dev/null || true"
+        )
+        await exec_in_sandbox(context, push_cmd, timeout_s=30.0)
+
     async def execute_task(
         self,
         *,
@@ -200,8 +295,33 @@ class SandboxWorker(WorkerBackend):
         on_event: Callable[[HarnessEvent], None] | None = None,
     ) -> WorkerExecutionResult:
         harness_impl = self.resolve_harness(harness)
-        sandbox_info = await self._ensure_sandbox()
         _, worktree_dir, branch_name = ensure_repo_and_worktree(repo, task_id)
+        use_host_worktree = os.getenv("ORCHESTRATOR_DISABLE_HOST_GIT", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        sandbox_wt_path = (
+            str(worktree_dir)
+            if use_host_worktree
+            else f"/workspace/.worktrees/{task_id}"
+        )
+
+        try:
+            sandbox_info = await self._ensure_sandbox()
+        except Exception as exc:
+            err_msg = f"Failed to resolve or provision Vertex Sandbox: {exc}"
+            logger.error("Sandbox resolution failed for task %s: %s", task_id, err_msg)
+            return WorkerExecutionResult(
+                exit_code=1,
+                summary=err_msg,
+                response_text=err_msg,
+                error=err_msg,
+                branch=branch_name,
+                worktree_path=sandbox_wt_path,
+                harness=harness_impl.name,
+                events=[err_msg],
+            )
 
         context = SandboxContext(
             user_id="default_user",
@@ -209,9 +329,9 @@ class SandboxWorker(WorkerBackend):
             lb_host=sandbox_info["lb_host"],
             routing_token=sandbox_info["routing_token"],
             sandbox_token=sandbox_info["sandbox_token"],
-            worktree_dir=worktree_dir,
+            worktree_dir=Path(sandbox_wt_path),
             branch=branch_name,
-            mock_mode=self.mock_mode,
+            http_transport=self._http_transport,
         )
 
         # Hard preflight gate: verify or provision the selected harness inside the sandbox
@@ -232,10 +352,18 @@ class SandboxWorker(WorkerBackend):
                 response_text=err_msg,
                 error=err_msg,
                 branch=branch_name,
-                worktree_path=str(worktree_dir),
+                worktree_path=sandbox_wt_path,
                 harness=harness_impl.name,
                 events=[err_msg],
             )
+
+        # Sync base repository with latest remote commits and checkout task worktree
+        await self._sync_remote_repository_in_sandbox(
+            context,
+            repo=repo,
+            task_id=task_id,
+            branch_name=branch_name,
+        )
 
         logger.info(
             "Executing task %s in Vertex Sandbox %s (harness=%s, mode=%s, branch=%s, worktree=%s)",
@@ -244,17 +372,20 @@ class SandboxWorker(WorkerBackend):
             harness_impl.name,
             mode,
             branch_name,
-            worktree_dir,
+            sandbox_wt_path,
         )
 
+        run_dir = f"/workspace/.sonar/runs/{task_id}"
         self._running_tasks[task_id] = {
             "harness": harness_impl.name,
             "sandbox_name": context.sandbox_name,
             "branch": branch_name,
-            "worktree_dir": str(worktree_dir),
+            "worktree_dir": sandbox_wt_path,
+            "run_dir": run_dir,
+            "context": context,
         }
         try:
-            return await harness_impl.execute_in_sandbox(
+            result = await harness_impl.execute_in_sandbox(
                 goal=goal,
                 repo=repo,
                 task_id=task_id,
@@ -264,10 +395,37 @@ class SandboxWorker(WorkerBackend):
                 session_id=session_id,
                 on_event=on_event,
             )
+            if (
+                result.exit_code == 0
+                and mode == "execute"
+                and not use_host_worktree
+            ):
+                await self._push_task_branch_to_remote(context, task_id, branch_name)
+            return result
         finally:
             self._running_tasks.pop(task_id, None)
 
     async def cancel_task(self, task_id: str) -> bool:
         logger.info("Cancelling task %s in sandbox", task_id)
-        self._running_tasks.pop(task_id, None)
+        info = self._running_tasks.pop(task_id, None)
+        if info:
+            from app.workers.harnesses.base import (
+                SandboxContext,
+                cancel_detached_command,
+            )
+
+            context = info.get("context") or SandboxContext(
+                user_id="default_user",
+                sandbox_name=info.get("sandbox_name") or "default_sandbox",
+                http_transport=self._http_transport,
+            )
+            run_handle = {
+                "run_id": task_id,
+                "run_dir": info.get("run_dir") or f"/workspace/.sonar/runs/{task_id}",
+            }
+            try:
+                await cancel_detached_command(context, run_handle)
+            except Exception as exc:
+                logger.debug("Remote cancel command failed: %s", exc)
         return True
+

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import tempfile
@@ -170,8 +171,8 @@ async def create_or_clone_repository(repo_name: str, git_url: str = "") -> str:
     """Create a new git-initialized repository in the workspace, or clone one from a Git URL.
 
     Args:
-        repo_name: Directory name for the repository (e.g. 'test-a' or 'prime-scripts').
-        git_url: Optional HTTPS Git URL to clone. If empty, initializes a fresh git repository on branch main.
+        repo_name: Directory name for the repository (e.g. 'test-a' or 'adk-python').
+        git_url: Optional Git URL or GitHub 'owner/repo' shorthand. If empty, initializes a fresh git repository on branch main.
 
     Returns:
         Spoken confirmation of the created or cloned repository.
@@ -184,18 +185,36 @@ async def create_or_clone_repository(repo_name: str, git_url: str = "") -> str:
         branch, status = _git_info(repo_dir)
         return f"Repository {slug} already exists on branch {branch} ({status})."
 
-    if git_url.strip():
+    url_target = git_url.strip()
+    if url_target:
+        # Support shorthand like "google/adk-python"
+        if not (url_target.startswith("https://") or url_target.startswith("http://") or url_target.startswith("git@")):
+            if "/" in url_target and not url_target.startswith("."):
+                url_target = f"https://github.com/{url_target}.git"
+
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         try:
-            subprocess.run(
-                ["git", "clone", "--depth", "1", git_url.strip(), str(repo_dir)],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=60,
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                url_target,
+                str(repo_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
-            return f"Cloned {git_url} into workspace repository {slug}."
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            if proc.returncode == 0:
+                branch, status = _git_info(repo_dir)
+                return f"Cloned {url_target} into workspace repository {slug} on branch {branch}."
+            err_msg = (stderr or stdout).decode(errors="replace").strip()
+            return f"Failed to clone {url_target}: {err_msg[:200]}"
+        except TimeoutError:
+            return f"Cloning {url_target} timed out after 25 seconds. Please check the URL or network connectivity."
         except Exception as exc:
-            return f"Failed to clone {git_url}: {exc}"
+            return f"Failed to clone {url_target}: {exc}"
 
     repo_dir.mkdir(parents=True, exist_ok=True)
     (repo_dir / "README.md").write_text(f"# {slug}\n")

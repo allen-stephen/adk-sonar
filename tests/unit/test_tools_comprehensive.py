@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from fastapi.testclient import TestClient
+from typing import ClassVar
+
 import pytest
+from fastapi.testclient import TestClient
 
 from app.agent import (
     approve_task,
@@ -15,9 +17,6 @@ from app.agent import (
     dispatch_task,
     get_task_result,
     inspect_repository_files,
-    list_harnesses,
-    list_integrations,
-    list_repositories,
     list_tasks,
     read_workspace_file,
     search_maps_grounded,
@@ -29,12 +28,20 @@ from app.agent import (
 )
 from app.fast_api_app import app
 from app.integrations import (
-    get_integration_registry,
     make_auth_header_provider,
     reset_integration_registry,
 )
 from app.tasks import get_task_registry, reset_task_registry
-from app.workers import get_harness_registry, reset_harness_registry
+from app.workers import (
+    HarnessNotProvisionedError,
+    SandboxContext,
+    SandboxWorker,
+    get_harness_registry,
+    get_sandbox_provisioner,
+    reset_harness_registry,
+    reset_sandbox_provisioner,
+)
+from tests.fakes import FakeHarness, exec_transport, sandbox_connection
 
 client = TestClient(app)
 
@@ -43,10 +50,12 @@ client = TestClient(app)
 def _clean_all():
     reset_task_registry()
     reset_harness_registry()
+    reset_sandbox_provisioner()
     reset_integration_registry()
     yield
     reset_task_registry()
     reset_harness_registry()
+    reset_sandbox_provisioner()
     reset_integration_registry()
 
 
@@ -74,15 +83,43 @@ async def test_task_tools_all_branches(
     assert "was not found" in await approve_task("task-999")
     assert "Could not cancel" in await cancel_task("task-999")
 
-    # Dispatch plan task + approval-required task
+    # Dispatch plan task + approval-required task.
+    # Two scripted harnesses stand in for real CLIs: one returns clarifying
+    # questions from plan mode, the other produces changes behind an approval gate.
     reg = get_harness_registry()
-    reg.get("claude").mock_step_delay_s = 0.02  # type: ignore[attr-defined]
-    await dispatch_task(goal="Plan feature", repo="r1", mode="plan", harness="claude")
+    planner = FakeHarness(
+        name="fake_planner",
+        display_name="Fake Planner",
+        summary="Drafted a plan for the feature.",
+        questions=["Should the feature be behind a flag?"],
+    )
+    builder = FakeHarness(
+        name="fake_builder",
+        display_name="Fake Builder",
+        summary="Implemented the feature.",
+        writes={"feature.py": "def feature() -> str:\n    return 'ok'\n"},
+    )
+    reg.register_harness(planner, aliases=["planner"])
+    reg.register_harness(builder, aliases=["builder"])
+
+    # The worker's real preflight gate still runs, so hand it a sandbox
+    # connection plus a mock `/exec` transport instead of live Vertex calls.
+    monkeypatch.setattr(
+        "app.workers.factory._active_worker",
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=exec_transport(exit_code=0),
+        ),
+    )
+
+    await dispatch_task(
+        goal="Plan feature", repo="r1", mode="plan", harness="fake_planner"
+    )
     await dispatch_task(
         goal="Code feature",
         repo="r1",
         mode="execute",
-        harness="claude",
+        harness="fake_builder",
         require_approval=True,
     )
 
@@ -91,6 +128,10 @@ async def test_task_tools_all_branches(
     h2 = await task_reg.get("task-2")
     assert h1 and h2
     await asyncio.gather(h1.async_task, h2.async_task)
+
+    assert h1.status == "awaiting_input"
+    assert h2.status == "awaiting_approval"
+    assert h2.pending_action is not None
 
     # list_tasks with awaiting_input and awaiting_approval
     tasks_summary = await list_tasks()
@@ -114,6 +155,7 @@ async def test_task_tools_all_branches(
 async def test_grounding_and_integration_tools(monkeypatch: pytest.MonkeyPatch):
     """Cover search_web_grounded, search_maps_grounded, configure_integration, and auth header provider."""
     from google.genai import types
+
     from app.agent import root_agent
     from app.tools.grounding_tools import GROUNDING_MODEL
 
@@ -147,9 +189,21 @@ async def test_grounding_and_integration_tools(monkeypatch: pytest.MonkeyPatch):
     maps_ans = await search_maps_grounded("library", "Mountain View")
     assert "Grounded answer for: library near Mountain View" in maps_ans
 
+    # Verify specialist failure fails closed without fabricating canned facts
+    async def _failing_specialist(_agent, _prompt: str) -> str:
+        raise RuntimeError("Upstream grounding quota exceeded")
+
+    monkeypatch.setattr("app.tools.grounding_tools._run_specialist", _failing_specialist)
+    err_web = await search_web_grounded("latest python release")
+    assert "could not complete the request" in err_web
+    assert "Python 3.13" not in err_web
+    err_maps = await search_maps_grounded("coffee shops")
+    assert "could not complete the request" in err_maps
+    assert "Medici Roasting" not in err_maps
+
     # Test auth header provider with session state and env fallback
     class _DummyCtx:
-        state = {"MY_TOKEN": "session-secret-123"}
+        state: ClassVar[dict[str, str]] = {"MY_TOKEN": "session-secret-123"}
 
     provider = make_auth_header_provider("MY_TOKEN")
     assert provider(_DummyCtx()) == {"Authorization": "Bearer session-secret-123"}  # type: ignore[arg-type]
@@ -187,14 +241,48 @@ def test_api_routes_control_plane_endpoints(
 ):
     """Cover control-plane endpoints in app/api_routes.py."""
     monkeypatch.setenv("ORCHESTRATOR_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "app.workers.factory._active_worker",
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=exec_transport(exit_code=0),
+        ),
+    )
 
     # 1. Switch default harness and trigger provisioning via API
     res_h = client.post("/api/v1/harnesses/default", json={"harness": "horizon"})
     assert res_h.status_code == 200
     assert res_h.json()["default_harness"]["name"] == "horizon"
 
+    # The provision route now really runs the preflight gate, so stub the
+    # provisioner rather than letting it dial out to a sandbox.
+    prov = get_sandbox_provisioner()
+
+    async def _ready(harness, context=None, **_kwargs):
+        state = prov.get_status(harness.name, (context or SandboxContext()).sandbox_name)
+        state.status = "ready"
+        state.error = None
+        return state
+
+    monkeypatch.setattr(prov, "ensure_provisioned", _ready)
     res_prov = client.post("/api/v1/harnesses/claude/provision")
     assert res_prov.status_code == 200
+    assert res_prov.json()["harness"] == "claude"
+    assert res_prov.json()["status"] == "ready"
+
+    # An unknown harness is a client error, not a silent success.
+    assert client.post("/api/v1/harnesses/not-a-harness/provision").status_code == 404
+
+    # A provisioning failure surfaces as 502 with the underlying reason.
+    async def _broken(harness, context=None, **_kwargs):
+        raise HarnessNotProvisionedError("npm registry timeout")
+
+    monkeypatch.setattr(prov, "ensure_provisioned", _broken)
+    res_broken = client.post("/api/v1/harnesses/claude/provision")
+    assert res_broken.status_code == 502
+    assert "npm registry timeout" in res_broken.json()["detail"]
+
+    monkeypatch.setattr(prov, "ensure_provisioned", _ready)
 
     # 2. Create task, steer task, cancel task via REST API
     create_res = client.post(

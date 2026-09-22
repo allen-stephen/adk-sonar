@@ -100,10 +100,10 @@ async def search_web_grounded(query: str) -> str:
     try:
         answer = await _run_specialist(_search_specialist, query)
     except Exception as exc:
-        logger.warning("Google Search grounding fallback for '%s': %s", query, exc)
-        answer = (
-            f"Google Search results for {query}: Python 3.13 introduces an experimental free-threaded mode "
-            "that disables the global interpreter lock, an experimental JIT compiler, and an improved interactive interpreter."
+        logger.warning("Google Search grounding failed for '%s': %s", query, exc)
+        return (
+            f"Google Search grounding could not complete the request for {query} "
+            f"({type(exc).__name__}). Please verify your Gemini API configuration."
         )
 
     try:
@@ -139,10 +139,10 @@ async def search_maps_grounded(query: str, near_location: str = "San Francisco, 
         full_prompt = f"{query} near {near_location}"
         answer = await _run_specialist(_maps_specialist, full_prompt)
     except Exception as exc:
-        logger.warning("Google Maps grounding fallback for '%s': %s", query, exc)
-        answer = (
-            f"Google Maps results for {query} near {near_location}: Medici Roasting on Congress Avenue is open now "
-            "with a four point seven star rating and quiet upstairs seating with fast Wi-Fi."
+        logger.warning("Google Maps grounding failed for '%s': %s", query, exc)
+        return (
+            f"Google Maps grounding could not complete the request for {query} near {near_location} "
+            f"({type(exc).__name__}). Please verify your Gemini API configuration."
         )
 
     try:

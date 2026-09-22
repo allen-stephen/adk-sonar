@@ -540,8 +540,15 @@ async def provision_shared_sandbox(
     clone_remotes: bool = False,
     auto_gcloud_token: bool = False,
     auto_gh_token: bool = False,
+    http_transport: Any | None = None,
 ) -> dict[str, Any]:
-    """Full end-to-end provisioning flow for the shared per-user sandbox and all coding harnesses."""
+    """Full end-to-end provisioning flow for the shared per-user sandbox and all coding harnesses.
+
+    Args:
+        http_transport: Optional `httpx` transport override used to reach the
+            sandbox. Production leaves this as None; tests inject a
+            `MockTransport` so provisioning never touches the network.
+    """
     secret_status = ensure_env_and_secrets(
         auto_gcloud_token=auto_gcloud_token,
         auto_gh_token=auto_gh_token,
@@ -575,7 +582,7 @@ async def provision_shared_sandbox(
         try:
             from app.workers.sandbox import SandboxWorker
 
-            live_sb_info = await SandboxWorker(mock_mode=False)._ensure_sandbox(user_id)
+            live_sb_info = await SandboxWorker()._ensure_sandbox(user_id)
         except Exception:
             live_sb_info = None
 
@@ -586,7 +593,7 @@ async def provision_shared_sandbox(
         routing_token=(live_sb_info["routing_token"] if live_sb_info else "mock-token"),
         sandbox_token=(live_sb_info["sandbox_token"] if live_sb_info else "mock-auth"),
         worktree_dir=(workspace_root or get_workspace_root()),
-        mock_mode=(is_mock or live_sb_info is None),
+        http_transport=http_transport,
     )
 
     if live_sb_info and not is_mock:
@@ -626,21 +633,32 @@ async def provision_shared_sandbox(
             print(f"  (Note: remote sandbox workspace seed skipped: {exc})")
 
     provisioner = get_sandbox_provisioner()
-    for tool_pkg in uv_tools:
-        await provisioner._exec_in_sandbox(
-            context,
-            f"uv tool install --upgrade {tool_pkg}",
-        )
+    # Reuse the harness preflight's resolved container layout so onboarding and
+    # runtime provisioning install to exactly the same places.
+    profile = await provisioner.get_runtime_profile(context, force_refresh=True)
+    print(
+        f"✓ Sandbox runtime: venv={profile.venv_path} "
+        f"npm_prefix={profile.npm_prefix or '(container default)'} "
+        f"{'root' if profile.is_root else 'non-root'}"
+        + (" [prebuilt env]" if profile.reuses_existing_venv else "")
+    )
+
+    install_steps: list[tuple[str, str]] = [("python virtualenv", profile.venv_bootstrap_command())]
+    install_steps += [(f"uv tool {t}", profile.uv_tool_install(t)) for t in uv_tools]
     if py_pkgs:
-        await provisioner._exec_in_sandbox(
-            context,
-            f"uv pip install --upgrade {' '.join(py_pkgs)}",
-        )
+        install_steps.append((f"{len(py_pkgs)} python packages", profile.uv_pip_install(py_pkgs)))
     if npm_pkgs:
-        await provisioner._exec_in_sandbox(
-            context,
-            f"npm install -g {' '.join(npm_pkgs)}",
-        )
+        install_steps.append((f"{len(npm_pkgs)} npm packages", profile.npm_global_install(npm_pkgs)))
+
+    for label, cmd in install_steps:
+        code, output = await provisioner._exec_in_sandbox(context, cmd)
+        if code == 0:
+            print(f"✓ Installed {label}")
+        else:
+            # Silently swallowing these is how the sandbox ended up with none of
+            # the manifest's packages installed.
+            print(f"✗ Failed to install {label} (exit {code}): {output.strip()[:300]}")
+
 
     harness_reg = get_harness_registry()
     target_names = harnesses or [h.name for h in harness_reg.list_all()]
@@ -658,7 +676,7 @@ async def provision_shared_sandbox(
                 routing_token=context.routing_token,
                 sandbox_token=context.sandbox_token,
                 worktree_dir=context.worktree_dir,
-                mock_mode=True,
+                http_transport=context.http_transport,
             ),
             force_refresh=True,
         )

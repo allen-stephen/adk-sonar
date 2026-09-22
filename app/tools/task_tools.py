@@ -272,7 +272,9 @@ async def list_tasks() -> str:
     waiting_input = [t for t in all_tasks if t.status == "awaiting_input"]
     waiting_approval = [t for t in all_tasks if t.status == "awaiting_approval"]
     finished = [
-        t for t in all_tasks if t.status in {"completed", "failed", "cancelled"}
+        t
+        for t in all_tasks
+        if t.status in {"completed", "failed", "cancelled", "orphaned"}
     ]
 
     parts: list[str] = []

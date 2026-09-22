@@ -2,6 +2,7 @@ metrics_to_run:
   - custom_response_quality
   - spoken_voice_compliance
   - expected_tool_called
+  - tool_argument_fidelity
   - async_tool_acknowledgment
 
 custom_metrics:
@@ -122,8 +123,12 @@ custom_metrics:
                           called_tools.append(fc["name"])
 
           required_all_map = {
-              "cuj1_and_cuj2_plan_question_and_steer": ["dispatch_task", "get_task_result", "steer_task"],
-              "cuj3_diff_gate_and_voice_approve": ["dispatch_task", "get_task_result", "approve_task"],
+              "plan_question_and_steer": ["dispatch_task", "get_task_result", "steer_task"],
+              "diff_gate_and_voice_approve": ["dispatch_task", "get_task_result", "approve_task"],
+              "parallel_fleet_dispatch_and_status": ["dispatch_task", "list_tasks"],
+              "cross_harness_handoff_in_worktree": ["dispatch_task", "get_task_result", "steer_task"],
+              "dispatch_and_cancel_lifecycle": ["dispatch_task", "cancel_task"],
+              "observable_failure_and_diff_compression": ["get_task_result", "approve_task"],
           }
           if case_id in required_all_map:
               required = required_all_map[case_id]
@@ -146,10 +151,11 @@ custom_metrics:
               "route_slack_channel": ["slack_messages", "slack_"],
               "route_github_pr_status": ["github_operations", "github_"],
               "route_coding_harness_dispatch": ["dispatch_task"],
+              "morning_checkin_fleet_briefing": ["list_tasks", "get_task_result"],
           }
           expected_tools = expected_any_map.get(case_id, [])
           if not expected_tools:
-              return {"score": 1.0, "explanation": "No specific tool assertion for case"}
+              return {"score": 0.0, "explanation": f"Unmapped eval_case_id '{case_id}' (fail-closed)"}
 
           matched = [
               c for c in called_tools
@@ -160,3 +166,49 @@ custom_metrics:
               "score": score,
               "explanation": f"Routed correctly via {matched} (all called: {called_tools})" if matched else f"Expected one of {expected_tools}, called {called_tools}",
           }
+
+  # Verifies argument-level precision for multi-harness handoffs, parallel dispatches,
+  # and plan/approval gates.
+  - name: tool_argument_fidelity
+    custom_function: |
+      def evaluate(instance):
+          case_id = instance.get("eval_case_id", "")
+          agent_data = instance.get("agent_data") or {}
+          turns = agent_data.get("turns") or []
+
+          calls = []
+          for turn in turns:
+              for ev in (turn.get("events") or []):
+                  content = ev.get("content") or {}
+                  for part in (content.get("parts") or []):
+                      fc = part.get("function_call")
+                      if isinstance(fc, dict) and fc.get("name"):
+                          calls.append((fc["name"], fc.get("args") or {}))
+
+          if case_id == "parallel_fleet_dispatch_and_status":
+              dispatches = [args for name, args in calls if name == "dispatch_task"]
+              repos = {str(a.get("repo", "")).lower() for a in dispatches}
+              ok = len(dispatches) >= 2 and "auth-svc" in repos and "billing-svc" in repos
+              return {
+                  "score": 1.0 if ok else 0.0,
+                  "explanation": f"Parallel dispatches: {dispatches}" if ok else f"Expected >=2 dispatches for auth-svc and billing-svc, got {dispatches}",
+              }
+
+          if case_id == "cross_harness_handoff_in_worktree":
+              steers = [args for name, args in calls if name == "steer_task"]
+              ok = any(str(a.get("harness", "")).lower() == "horizon" for a in steers)
+              return {
+                  "score": 1.0 if ok else 0.0,
+                  "explanation": f"Cross-harness handoff args: {steers}" if ok else f"Expected steer_task with harness='horizon', got {steers}",
+              }
+
+          if case_id == "observable_failure_and_diff_compression":
+              approves = [args for name, args in calls if name == "approve_task"]
+              ok = any("901" in str(a.get("task_id", "")) for a in approves)
+              return {
+                  "score": 1.0 if ok else 0.0,
+                  "explanation": f"Approved seeded task-901: {approves}" if ok else f"Expected approve_task on task-901, got {approves}",
+              }
+
+          return {"score": 1.0, "explanation": "Argument check passed"}
+

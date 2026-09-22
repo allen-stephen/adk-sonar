@@ -172,22 +172,24 @@ def get_redirect_uri(provider: str, request: Request | None = None) -> str:
     return f"{base}/api/v1/auth/{provider}/callback"
 
 
+def _resolve_dotenv_path() -> Path:
+    custom = os.getenv("ORCHESTRATOR_DOTENV_PATH")
+    return Path(custom).resolve() if custom else DOTENV_PATH
+
+
 def persist_env_vars(updates: dict[str, str | None]) -> None:
-    """Updates process environment variables and persists them to `.env` (outside unit tests)."""
+    """Updates process environment variables and persists them to the configured `.env` file."""
     for k, v in updates.items():
         if v is None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
 
-    # Do not mutate workspace .env file during pytest runs
-    if os.getenv("PYTEST_CURRENT_TEST"):
-        return
-
+    target_dotenv = _resolve_dotenv_path()
     try:
         existing_lines: list[str] = []
-        if DOTENV_PATH.exists():
-            existing_lines = DOTENV_PATH.read_text().splitlines()
+        if target_dotenv.exists():
+            existing_lines = target_dotenv.read_text().splitlines()
 
         updated_keys: set[str] = set()
         new_lines: list[str] = []
@@ -209,16 +211,17 @@ def persist_env_vars(updates: dict[str, str | None]) -> None:
             if k not in updated_keys and val is not None:
                 new_lines.append(f'{k}="{val}"')
 
-        DOTENV_PATH.write_text("\n".join(new_lines) + "\n")
+        target_dotenv.write_text("\n".join(new_lines) + "\n")
     except Exception as exc:
         logger.debug("Skipped writing .env file: %s", exc)
 
 
 def _sync_dotenv_if_needed() -> None:
-    if not os.getenv("PYTEST_CURRENT_TEST") and DOTENV_PATH.exists():
+    target_dotenv = _resolve_dotenv_path()
+    if target_dotenv.exists():
         from dotenv import load_dotenv
 
-        load_dotenv(DOTENV_PATH, override=False)
+        load_dotenv(target_dotenv, override=False)
 
 
 def has_provider_credentials(provider: str) -> bool:
@@ -539,7 +542,9 @@ async def ensure_fresh_access_token(provider: str, *, force: bool = False) -> st
         cid = os.getenv(cid_env, "").strip()
         csec = os.getenv(csec_env, "").strip()
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            from app.app_utils.http_client import get_http_client
+
+            async with get_http_client(timeout=10.0) as client:
                 if provider == "spotify":
                     basic = base64.b64encode(f"{cid}:{csec}".encode()).decode()
                     resp = await client.post(
@@ -606,6 +611,8 @@ async def verify_and_save_token(
     account_hint: str | None = None,
 ) -> dict[str, Any]:
     """Verifies a token against the provider's identity API, auto-discovers metadata (like SLACK_TEAM_ID), and saves it."""
+    from app.app_utils.http_client import get_http_client
+
     cfg = PROVIDER_CONFIGS.get(provider)
     if not cfg:
         raise ValueError(f"Unknown provider: {provider}")
@@ -624,73 +631,63 @@ async def verify_and_save_token(
     account_label = account_hint
     now = time.time()
 
-    # Skip external HTTP verification for deterministic unit/eval test tokens
-    is_mock_token = (
-        clean_token.startswith("xoxb-test")
-        or clean_token.startswith("ghp_test")
-        or clean_token.startswith("ya29.workspace-live")
-        or clean_token.startswith("test-")
-        or bool(os.getenv("PYTEST_CURRENT_TEST"))
-    )
-
-    if not is_mock_token:
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                if provider == "slack":
-                    resp = await client.post(
-                        "https://slack.com/api/auth.test",
-                        headers={"Authorization": f"Bearer {clean_token}"},
+    try:
+        async with get_http_client(timeout=8.0) as client:
+            if provider == "slack":
+                resp = await client.post(
+                    "https://slack.com/api/auth.test",
+                    headers={"Authorization": f"Bearer {clean_token}"},
+                )
+                data = resp.json()
+                if data.get("ok"):
+                    team_id = data.get("team_id")
+                    team_name = data.get("team")
+                    user_name = data.get("user")
+                    if team_id:
+                        updates["SLACK_TEAM_ID"] = str(team_id)
+                    account_label = (
+                        f"{team_name} (@{user_name})"
+                        if team_name and user_name
+                        else team_name or team_id
                     )
+            elif provider == "github":
+                resp = await client.get(
+                    "https://api.github.com/user",
+                    headers={
+                        "Authorization": f"Bearer {clean_token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                )
+                if resp.status_code == 200:
                     data = resp.json()
-                    if data.get("ok"):
-                        team_id = data.get("team_id")
-                        team_name = data.get("team")
-                        user_name = data.get("user")
-                        if team_id:
-                            updates["SLACK_TEAM_ID"] = str(team_id)
+                    login = data.get("login")
+                    if login:
+                        account_label = f"@{login}"
+            elif provider == "spotify":
+                resp = await client.get(
+                    "https://api.spotify.com/v1/me",
+                    headers={"Authorization": f"Bearer {clean_token}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    display = data.get("display_name") or data.get("email")
+                    product = data.get("product")
+                    if display:
                         account_label = (
-                            f"{team_name} (@{user_name})"
-                            if team_name and user_name
-                            else team_name or team_id
+                            f"{display} ({product.title()})"
+                            if product
+                            else str(display)
                         )
-                elif provider == "github":
-                    resp = await client.get(
-                        "https://api.github.com/user",
-                        headers={
-                            "Authorization": f"Bearer {clean_token}",
-                            "Accept": "application/vnd.github+json",
-                        },
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        login = data.get("login")
-                        if login:
-                            account_label = f"@{login}"
-                elif provider == "spotify":
-                    resp = await client.get(
-                        "https://api.spotify.com/v1/me",
-                        headers={"Authorization": f"Bearer {clean_token}"},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        display = data.get("display_name") or data.get("email")
-                        product = data.get("product")
-                        if display:
-                            account_label = (
-                                f"{display} ({product.title()})"
-                                if product
-                                else str(display)
-                            )
-                elif provider == "google_workspace":
-                    resp = await client.get(
-                        "https://www.googleapis.com/oauth2/v2/userinfo",
-                        headers={"Authorization": f"Bearer {clean_token}"},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        account_label = data.get("email") or data.get("name")
-        except Exception as exc:
-            logger.debug("Live token verification skipped for %s: %s", provider, exc)
+            elif provider == "google_workspace":
+                resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {clean_token}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    account_label = data.get("email") or data.get("name")
+    except Exception as exc:
+        logger.debug("Live token verification skipped for %s: %s", provider, exc)
 
     persist_env_vars(updates)
 
@@ -1085,7 +1082,7 @@ async def run_local_browser_oauth(provider: str) -> dict[str, Any]:
         return verified.get(provider, {"verified": False})
 
     class _CallbackHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             if "code" in qs:
@@ -1103,7 +1100,7 @@ async def run_local_browser_oauth(provider: str) -> dict[str, Any]:
                 b"<script>setTimeout(()=>window.close(),800);</script></body></html>"
             )
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             pass
 
     httpd = HTTPServer(("127.0.0.1", 8000), _CallbackHandler)

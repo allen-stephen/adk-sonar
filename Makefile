@@ -1,4 +1,4 @@
-.PHONY: onboard dev check deploy sync-secrets provision seed setup setup-workspace discover test eval eval-routing playground web
+.PHONY: onboard dev check deploy sync-secrets provision seed setup setup-workspace discover test eval playground web
 
 # ==============================================================================
 # 1. CORE 3-STEP WORKFLOW (Onboard -> Dev -> Deploy)
@@ -47,12 +47,13 @@ provision:
 test:
 	uv run pytest tests/unit tests/integration
 
-# Run ADK Live evaluation suites
-eval:
-	agents-cli eval run --mode adk_live
+# Run ADK Live evaluation suite (override dataset with: make eval DATASET=tests/eval/datasets/coding-tasks.json)
+EVAL_DB_URL ?= sqlite+aiosqlite:////tmp/sonar_eval_tasks.db
+DATASET ?= tests/eval/datasets/basic-dataset.json
 
-eval-routing:
-	agents-cli eval run --mode adk_live --dataset tests/eval/datasets/routing-dataset.json
+eval:
+	TASK_DB_URL=$(EVAL_DB_URL) uv run python tests/eval/seed_eval_store.py
+	PYTHONPATH=tests/eval:. TASK_DB_URL=$(EVAL_DB_URL) agents-cli eval run --mode adk_live --dataset $(DATASET) --config tests/eval/eval_config.yaml
 
 # ==============================================================================
 # 3. GRANULAR HELPERS

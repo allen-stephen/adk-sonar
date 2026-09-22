@@ -27,12 +27,10 @@ from fastapi import FastAPI
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.runners import Runner
 
-import sys
-
 from app.app_utils import services
 
-if "pytest" not in sys.modules:
-    load_dotenv()
+if os.getenv("ORCHESTRATOR_LOAD_DOTENV", "1") != "0":
+    load_dotenv(os.getenv("ORCHESTRATOR_DOTENV_PATH") or None)
 _default_origins = (
     "http://127.0.0.1:3000,http://localhost:3000,"
     "http://127.0.0.1:5173,http://localhost:5173,"
@@ -68,7 +66,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         pass
 
     # 2. Warm/refresh OAuth access tokens (Spotify & Google Workspace) from refresh tokens on boot
-    if not os.getenv("PYTEST_CURRENT_TEST"):
+    if os.getenv("ORCHESTRATOR_SKIP_STARTUP_WARMUP", "").lower() not in {"1", "true", "yes"}:
         try:
             await ensure_fresh_access_token("spotify")
             await ensure_fresh_access_token("google_workspace")
@@ -79,6 +77,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             pass
 
+    from app.store.engine import close_db, init_db
+
+    try:
+        await init_db()
+    except Exception:
+        pass
+
     runner = Runner(
         app=adk_app,
         session_service=services.get_session_service(),
@@ -88,6 +93,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.runner = runner
     app.state.agent_app_name = adk_app.name
     yield
+    try:
+        await close_db()
+    except Exception:
+        pass
 
 
 app: FastAPI = get_fast_api_app(
@@ -96,10 +105,13 @@ app: FastAPI = get_fast_api_app(
     artifact_service_uri=services.ARTIFACT_SERVICE_URI,
     allow_origins=allow_origins,
     session_service_uri=services.SESSION_SERVICE_URI,
+    memory_service_uri=services.MEMORY_SERVICE_URI,
     otel_to_cloud=otel_to_cloud,
     lifespan=lifespan,
 )
-from app.api_routes import router as ui_control_router
+# Imported after `load_dotenv()` above: `app.api_routes` pulls in `app.agent`,
+# which reads configuration from the environment at import time.
+from app.api_routes import router as ui_control_router  # noqa: E402
 
 app.title = "voice-orchestrator"
 app.description = "Voice orchestrator for remote Claude Code coding agents"

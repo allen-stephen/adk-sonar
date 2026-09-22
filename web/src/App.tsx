@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { ChevronDown, ChevronUp, Mic, Pause, Play, SlidersHorizontal, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Layers, Mic, Pause, Play, SlidersHorizontal, X } from "lucide-react";
 import { A2UISurfaceDeck } from "./components/a2ui/A2UISurfaceDeck";
 import { HarnessBrandIcon } from "./components/BrandIcons";
 import { ConnectionsSheet } from "./components/sheets/ConnectionsSheet";
+import { FleetTasksSheet } from "./components/sheets/FleetTasksSheet";
 import { GeminiAuroraCanvas } from "./components/stage/GeminiAuroraCanvas";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -71,6 +72,7 @@ export function App() {
   });
 
   const [configOpen, setConfigOpen] = useState(false);
+  const [fleetOpen, setFleetOpen] = useState(false);
   const [isStackCollapsed, setIsStackCollapsed] = useState(false);
 
   const state = serverState || FALLBACK_STATE;
@@ -201,18 +203,34 @@ export function App() {
               )}
             </div>
 
-            <button
-              type="button"
-              id="open-configuration-sheet-btn"
-              className="top-config-btn"
-              onClick={() => setConfigOpen((prev) => !prev)}
-              aria-label="Open Configuration Sheet"
-            >
-              <SlidersHorizontal size={16} />
-              {unreadyConnections > 0 && (
-                <span className="dock-badge">{unreadyConnections}</span>
-              )}
-            </button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                type="button"
+                id="open-fleet-sheet-btn"
+                className="top-config-btn"
+                onClick={() => setFleetOpen((prev) => !prev)}
+                aria-label="Open Agent Fleet Sheet"
+                title="View background agent fleet"
+              >
+                <Layers size={16} />
+                {state.tasks.length > 0 && (
+                  <span className="dock-badge">{state.tasks.length}</span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                id="open-configuration-sheet-btn"
+                className="top-config-btn"
+                onClick={() => setConfigOpen((prev) => !prev)}
+                aria-label="Open Configuration Sheet"
+              >
+                <SlidersHorizontal size={16} />
+                {unreadyConnections > 0 && (
+                  <span className="dock-badge">{unreadyConnections}</span>
+                )}
+              </button>
+            </div>
           </header>
 
           {/* 2. Center Stage: Default ADK Sonar Splash (when idle) or Collapsible A2UI Agent Stack */}
@@ -240,6 +258,18 @@ export function App() {
               <span>{activityLabel}</span>
             </div>
           </div>
+
+          {/* Slide-up Agent Fleet Sheet */}
+          {fleetOpen && (
+            <FleetTasksSheet
+              state={state}
+              onClose={() => setFleetOpen(false)}
+              onApprovePlan={handleApprovePlan}
+              onCreateTask={(goal, repo, mode) =>
+                actions.createTask.mutate({ goal, repo, mode })
+              }
+            />
+          )}
 
           {/* Slide-up Configuration Sheet */}
           {configOpen && (
