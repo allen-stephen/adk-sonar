@@ -160,6 +160,20 @@ For the full file map, maintenance rules, and troubleshooting guide (`X-Goog-Use
 
 ---
 
+## A2UI Visual Surface Catalog
+
+| Surface Card | Component File | Triggered By | Visual Payload |
+|---|---|---|---|
+| **Task Status Card** | `TaskStatusCard.tsx` | Task dispatch & execution | Real-time terminal output, elapsed time, and active harness |
+| **Plan Review Gate** | `PlanReviewCard.tsx` | `mode="plan"` completion | Markdown plan diff, clarify questions, approve / steer buttons |
+| **GitHub PR Card** | `GitHubPRCard.tsx` | `github_operations` tool | PR status badges, diff lines, author, and branch labels |
+| **Spotify Player Card** | `SpotifyPlayerCard.tsx` | `spotify_playback` tool | Album art, playback state, active device, and track details |
+| **Calendar Agenda Card** | `CalendarAgendaCard.tsx` | `calendar_events` tool | Upcoming event titles, start/end times, attendee list, and video call join links |
+| **Workspace Digest Card** | `WorkspaceDigestCard.tsx` | `workspace_digest` tool | Unread message count, priority email summaries, and recent Drive file activity |
+| **Google Place Card** | `PlaceCard.tsx` | `maps_search` tool | Place name, address, star rating, opening hours, and Google Maps link |
+
+---
+
 ## Deploy
 
 Deploy the full-stack application (compiled React PWA + FastAPI WebSocket server) to **Google Cloud Run** and sync your local `.env` secrets in two commands:
