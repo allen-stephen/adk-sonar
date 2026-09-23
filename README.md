@@ -164,6 +164,18 @@ make sync-secrets
 
 ---
 
+## Quick Reference Commands
+
+| Command | Purpose |
+|---|---|
+| `make onboard` | Run the interactive 5-minute setup wizard |
+| `make check` | Run non-interactive environment & integration health check |
+| `make dev` | Start both FastAPI backend and Vite React UI locally |
+| `make test` | Run unit and integration tests |
+<!-- TODO: Add make eval and make deploy command rows here -->
+
+---
+
 ## Disclaimer
 
 This repository is for demonstrative and educational purposes only. It is not an officially supported Google product.
