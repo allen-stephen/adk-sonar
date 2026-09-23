@@ -53,7 +53,7 @@ An [ADK](https://google.github.io/adk-docs/) reference implementation demonstrat
 1. **Audio Ingest & Barge-in** (`gemini-live-2.5-flash-native-audio`) — Continuous 16kHz PCM streaming and barge-in over WebSockets.
 2. **Non-Blocking Dispatch** (`@non_blocking_tool`) — Yields pending status to voice persona Charon with `WHEN_IDLE` scheduling hint.
 3. **Sandbox Execution** (`SandboxWorker`) — Harness (`claude`, `antigravity`, or `horizon`) executes in an isolated git worktree (`/workspace/.worktrees/<task_id>`).
-<!-- TODO: Add Step 4 for Scoped A2UI Surface Deck card rendering alongside spoken narration -->
+4. **Scoped A2UI Surface Deck** (`emit_surface_for_tool`) — Tool completion triggers `app/callbacks/a2ui_emitter.py`, which maps the result to the appropriate scoped card (`TaskStatusCard`, `PlanReviewCard`, `GitHubPRCard`, etc.) and pushes it to `web/src/components/a2ui/A2UISurfaceDeck.tsx`; Charon simultaneously delivers a 1–2 sentence spoken summary over the live audio stream.
 
 ---
 
