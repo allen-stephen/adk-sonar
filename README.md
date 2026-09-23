@@ -84,6 +84,48 @@ See [`AGENTS.md`](AGENTS.md) for the complete architecture map, start-here file 
 - **Google Cloud SDK (`gcloud`)** authenticated against a GCP project with **Vertex AI API** enabled (`gcloud auth login`)
 - *(Optional)* **GitHub CLI (`gh`)** logged in (`gh auth login`) to automatically clone your personal forks into the sandbox
 
+### Environment Variables
+
+Copy `.env.example` to `.env` — `make onboard` auto-populates most values from your local `gcloud` and `gh` CLI sessions. The table below lists every variable the orchestrator reads, organized by group.
+
+> Variables marked **✅ Required** must be set before `make dev`. Variables marked **optional** unlock specific integrations and can be set later from the **Connected Apps** UI.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| **— Core GCP / Vertex AI —** | | | |
+| `GOOGLE_GENAI_USE_VERTEXAI` | ✅ | `true` | Route all model calls through Vertex AI. Required for `gemini-live-2.5-flash-native-audio`. |
+| `GOOGLE_CLOUD_PROJECT` | ✅ | — | GCP project ID used for Vertex AI API calls and billing quota. |
+| `GOOGLE_CLOUD_LOCATION` | ✅ | `us-central1` | GCP region. **Must be `us-central1`** — Gemini Live native audio is only available there. |
+| `GEMINI_API_KEY` | optional | — | Google AI Studio API key. Alternative to Vertex AI ADC; mutually exclusive with `GOOGLE_GENAI_USE_VERTEXAI=true`. |
+| **— Sandbox & Coding Harnesses —** | | | |
+| `CODING_HARNESS` | ✅ | `horizon` | Active coding harness: `horizon` (ADK Long-Horizon), `antigravity`, or `claude` (Claude Code). |
+| `WORKER_BACKEND` | ✅ | `sandbox` | Execution backend: `sandbox` (Vertex AI Agent Engine) or `local` (in-process fallback). |
+| `SANDBOX_GCP_PROJECT` | optional | `GOOGLE_CLOUD_PROJECT` | GCP project that hosts the Vertex AI Agent Engine Sandbox. Defaults to `GOOGLE_CLOUD_PROJECT`. |
+| `SANDBOX_GCP_LOCATION` | optional | `us-central1` | Region for the Vertex AI Agent Engine Sandbox container. |
+| `CLAUDE_CODE_USE_VERTEX` | optional | `1` | Enable Claude Code via Vertex AI Model Garden. Set to `1` when `CODING_HARNESS=claude`. |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | optional | `GOOGLE_CLOUD_PROJECT` | GCP project for Claude Code on Vertex AI. Defaults to `GOOGLE_CLOUD_PROJECT`. |
+| `VERTEX_SANDBOX_RESOURCE_NAME` | optional | — | Full resource name of a pinned Vertex AI Sandbox. Auto-written by `make onboard` / `make sandbox`. |
+| `AGENT_ENGINE_RESOURCE_NAME` | optional | — | Parent Agent Engine resource name. Auto-written by `make onboard`. |
+| **— Google Workspace (Calendar, Gmail, Drive) —** | | | |
+| `GOOGLE_WORKSPACE_ACCESS_TOKEN` | optional | — | ADC access token for Workspace MCP servers. Auto-populated locally via `gcloud auth print-access-token`. |
+| `GOOGLE_OAUTH_CLIENT_ID` | optional | — | OAuth 2.0 Web Client ID. Required for 1-click Workspace sign-in on a deployed Cloud Run service. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | optional | — | OAuth 2.0 Web Client Secret. Required alongside `GOOGLE_OAUTH_CLIENT_ID` on Cloud Run. |
+| `GOOGLE_WORKSPACE_REFRESH_TOKEN` | optional | — | Refresh token for silent Workspace access-token rotation (`app/auth.py`). |
+| **— GitHub —** | | | |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | optional | — | GitHub PAT with `repo`, `read:org`, and `workflow` scopes. Auto-populated from `gh auth token` by `make onboard`. |
+| `GITHUB_CLIENT_ID` | optional | — | GitHub OAuth App Client ID. Enables browser-based GitHub sign-in from the Connected Apps UI. |
+| `GITHUB_CLIENT_SECRET` | optional | — | GitHub OAuth App Client Secret. Required alongside `GITHUB_CLIENT_ID`. |
+| **— Spotify —** | | | |
+| `SPOTIFY_CLIENT_ID` | optional | — | Spotify Developer Dashboard App Client ID. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard). |
+| `SPOTIFY_CLIENT_SECRET` | optional | — | Spotify Developer Dashboard App Client Secret. |
+| `SPOTIFY_REFRESH_TOKEN` | optional | — | Refresh token for silent Spotify access-token rotation. Populated after first OAuth sign-in. |
+| `SPOTIFY_ACCESS_TOKEN` | optional | — | Current Spotify access token. Auto-refreshed by `app/auth.py` when a refresh token is present. |
+| **— Slack —** | | | |
+| `SLACK_BOT_TOKEN` | optional | — | Slack Bot User OAuth Token (`xoxb-...`). Create at [api.slack.com/apps](https://api.slack.com/apps). |
+| `SLACK_TEAM_ID` | optional | — | Slack Workspace Team ID. Auto-discovered via `slack.com/api/auth.test` at startup. |
+| **— Deployment (Cloud Run) —** | | | |
+| `APP_URL` | optional | — | Public base URL of your deployed Cloud Run service (e.g. `https://adk-sonar-xyz-uc.a.run.app`). Required for OAuth redirect URIs when deployed. Auto-pushed by `make sync-secrets`. |
+
 ### 1. Clone & run interactive onboarding (5 minutes)
 
 The onboarding wizard (`make onboard`) configures your GCP project, provisions your live **Vertex AI Agent Engine Sandbox**, clones your personal GitHub forks into `/workspaces`, and walks through connecting **Google Workspace, Google Search, Google Maps, GitHub, Spotify, and Slack** (or press `Enter` to skip any integration and toggle it later from the mobile UI):
