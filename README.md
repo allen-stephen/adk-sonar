@@ -48,6 +48,13 @@ An [ADK](https://google.github.io/adk-docs/) reference implementation demonstrat
 **Zero-Friction OAuth & Live Integrations**
 - **Unified OAuth 2.0 + Refresh Token lifecycle (`app/auth.py`)** — Built-in PKCE + refresh token auto-rotation for **Spotify** and **Google Workspace** (Calendar, Gmail, Drive), 1-click `gcloud` / `gh` CLI detection, dynamic personal fork discovery (`GET /user` → `<owner>/<repo>`), and automatic **Slack** workspace discovery (`auth.test`).
 
+### Voice-to-Sandbox Request Lifecycle
+
+1. **Audio Ingest & Barge-in** (`gemini-live-2.5-flash-native-audio`) — Continuous 16kHz PCM streaming and barge-in over WebSockets.
+2. **Non-Blocking Dispatch** (`@non_blocking_tool`) — Yields pending status to voice persona Charon with `WHEN_IDLE` scheduling hint.
+3. **Sandbox Execution** (`SandboxWorker`) — Harness (`claude`, `antigravity`, or `horizon`) executes in an isolated git worktree (`/workspace/.worktrees/<task_id>`).
+<!-- TODO: Add Step 4 for Scoped A2UI Surface Deck card rendering alongside spoken narration -->
+
 ---
 
 ## The stack
