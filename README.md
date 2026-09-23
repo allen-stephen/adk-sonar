@@ -155,7 +155,9 @@ For the full file map, maintenance rules, and troubleshooting guide (`X-Goog-Use
 | **Plan Review Gate** | `PlanReviewCard.tsx` | `mode="plan"` completion | Markdown plan diff, clarify questions, approve / steer buttons |
 | **GitHub PR Card** | `GitHubPRCard.tsx` | `github_operations` tool | PR status badges, diff lines, author, and branch labels |
 | **Spotify Player Card** | `SpotifyPlayerCard.tsx` | `spotify_playback` tool | Album art, playback state, active device, and track details |
-<!-- TODO: Add catalog rows for CalendarAgendaCard, WorkspaceDigestCard, and GooglePlaceCard -->
+| **Calendar Agenda Card** | `CalendarAgendaCard.tsx` | `calendar_events` tool | Upcoming event titles, start/end times, attendee list, and video call join links |
+| **Workspace Digest Card** | `WorkspaceDigestCard.tsx` | `workspace_digest` tool | Unread message count, priority email summaries, and recent Drive file activity |
+| **Google Place Card** | `PlaceCard.tsx` | `maps_search` tool | Place name, address, star rating, opening hours, and Google Maps link |
 
 ---
 
@@ -179,3 +181,4 @@ make sync-secrets
 ## Disclaimer
 
 This repository is for demonstrative and educational purposes only. It is not an officially supported Google product.
+
