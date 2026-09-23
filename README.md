@@ -172,7 +172,8 @@ make sync-secrets
 | `make check` | Run non-interactive environment & integration health check |
 | `make dev` | Start both FastAPI backend and Vite React UI locally |
 | `make test` | Run unit and integration tests |
-<!-- TODO: Add make eval and make deploy command rows here -->
+| `make eval` | Run ADK Live evaluation suites |
+| `make deploy` | Build and deploy the container to Cloud Run (us-central1) |
 
 ---
 
