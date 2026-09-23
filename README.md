@@ -121,7 +121,10 @@ Tap the center **Mic button** to start a live voice session, or open **Connected
 | `GOOGLE_CLOUD_LOCATION` | Region for Gemini Live native audio and Vertex Sandbox | `us-central1` |
 | `SANDBOX_GCP_PROJECT` | GCP project ID hosting the Vertex Sandbox container | Inherits `GOOGLE_CLOUD_PROJECT` |
 | `LIVE_VOICE_NAME` | Default Gemini Live persona voice (`Aoede`, `Puck`, `Charon`, `Kore`) | `Aoede` |
-<!-- TODO: Add rows for OAuth credentials: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, GITHUB_PERSONAL_ACCESS_TOKEN, and SLACK_BOT_TOKEN -->
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub PAT with `repo`, `read:org`, and `workflow` scopes. Auto-populated from `gh auth token` by `make onboard`. | `ghp_...` |
+| `SPOTIFY_CLIENT_ID` | Spotify Developer Dashboard App Client ID. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard). | — |
+| `SPOTIFY_CLIENT_SECRET` | Spotify Developer Dashboard App Client Secret. | — |
+| `SLACK_BOT_TOKEN` | Slack Bot User OAuth Token. Create a Slack app and install it at [api.slack.com/apps](https://api.slack.com/apps). | `xoxb-...` |
 
 ---
 
@@ -177,3 +180,4 @@ make sync-secrets
 ## Disclaimer
 
 This repository is for demonstrative and educational purposes only. It is not an officially supported Google product.
+
