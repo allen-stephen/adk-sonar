@@ -113,6 +113,16 @@ make dev
 
 Tap the center **Mic button** to start a live voice session, or open **Connected Apps** (plug icon in the top header) to toggle integrations with 1-click OAuth.
 
+### Essential Environment Variables
+
+| Variable | Description | Default / Example |
+|---|---|---|
+| `GOOGLE_CLOUD_PROJECT` | Active Google Cloud project ID hosting Vertex AI | e.g. `agents-cli-test-dev-qi5zi1` |
+| `GOOGLE_CLOUD_LOCATION` | Region for Gemini Live native audio and Vertex Sandbox | `us-central1` |
+| `SANDBOX_GCP_PROJECT` | GCP project ID hosting the Vertex Sandbox container | Inherits `GOOGLE_CLOUD_PROJECT` |
+| `LIVE_VOICE_NAME` | Default Gemini Live persona voice (`Aoede`, `Puck`, `Charon`, `Kore`) | `Aoede` |
+<!-- TODO: Add rows for OAuth credentials: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, GITHUB_PERSONAL_ACCESS_TOKEN, and SLACK_BOT_TOKEN -->
+
 ---
 
 ## Build your own with a coding agent
