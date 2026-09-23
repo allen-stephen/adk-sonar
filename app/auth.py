@@ -1163,3 +1163,87 @@ def export_deployment_env() -> str:
         if val:
             lines.append(f'{key}="{val}"')
     return "\n".join(lines) + "\n"
+
+
+_sandbox_gcp_token_cache: tuple[float, str, str] | None = None
+
+
+def get_sandbox_gcp_env() -> dict[str, str]:
+    """Build GCP authentication and project environment variables for sandbox `/exec` commands.
+
+    Caches resolved `cloud-platform` access tokens for 5 minutes so repeated
+    sandbox command executions and polls never block on credential discovery.
+    """
+    global _sandbox_gcp_token_cache
+
+    project_id = (
+        os.getenv("SANDBOX_GCP_PROJECT")
+        or os.getenv("GOOGLE_CLOUD_PROJECT")
+        or ""
+    ).strip()
+    location = (
+        os.getenv("SANDBOX_GCP_LOCATION")
+        or os.getenv("GOOGLE_CLOUD_LOCATION")
+        or "us-central1"
+    ).strip()
+
+    now = time.monotonic()
+    token = (os.getenv("SANDBOX_GCP_ACCESS_TOKEN") or "").strip()
+
+    if not token and _sandbox_gcp_token_cache is not None:
+        cached_at, cached_proj, cached_tok = _sandbox_gcp_token_cache
+        if (now - cached_at) < 300.0:
+            if not project_id and cached_proj:
+                project_id = cached_proj
+            token = cached_tok
+
+    if not token and not os.getenv("PYTEST_CURRENT_TEST"):
+        try:
+            import google.auth
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+
+            creds, default_proj = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            if not project_id and default_proj:
+                project_id = str(default_proj).strip()
+            if creds:
+                if not creds.valid or not getattr(creds, "token", None):
+                    creds.refresh(GoogleAuthRequest())
+                if getattr(creds, "token", None):
+                    token = str(creds.token).strip()
+        except Exception:
+            pass
+
+        if not token and shutil.which("gcloud"):
+            try:
+                proc = subprocess.run(
+                    ["gcloud", "auth", "print-access-token"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    token = proc.stdout.strip()
+            except Exception:
+                pass
+
+        _sandbox_gcp_token_cache = (now, project_id, token)
+
+    env: dict[str, str] = {
+        "GOOGLE_CLOUD_LOCATION": location,
+        "GOOGLE_GENAI_USE_VERTEXAI": os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE"),
+    }
+    if project_id:
+        env["GOOGLE_CLOUD_PROJECT"] = project_id
+        env["CLOUDSDK_CORE_PROJECT"] = project_id
+        env["GOOGLE_CLOUD_QUOTA_PROJECT"] = project_id
+        env["ANTHROPIC_VERTEX_PROJECT_ID"] = os.getenv(
+            "ANTHROPIC_VERTEX_PROJECT_ID", project_id
+        )
+    if token:
+        env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
+        env["GOOGLE_OAUTH_ACCESS_TOKEN"] = token
+    return env
+

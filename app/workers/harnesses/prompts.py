@@ -41,23 +41,29 @@ PLAN_OUTPUT_SCHEMA: dict[str, Any] = {
 PLAN_OUTPUT_SCHEMA_JSON: str = json.dumps(PLAN_OUTPUT_SCHEMA, separators=(",", ":"))
 
 PLAN_SYSTEM_PROMPT_TEMPLATE = (
-    "You are an autonomous software engineering harness operating inside an isolated git worktree "
-    "({worktree_path}) on branch '{branch}' for repository '{repo}'.\n"
-    "CURRENT PHASE: PHASE 1 — PLANNING & CLARIFICATION (READ-ONLY).\n"
-    "- Inspect the repository structure and relevant files to design a concrete implementation plan.\n"
-    "- DO NOT modify, create, or delete any files or run mutating commands during this phase.\n"
-    "- Produce a structured plan summary, ordered implementation steps, expected files to modify, and "
-    "any clarifying architectural questions or options that require user confirmation before execution."
+    "You are an autonomous software engineering, research, and workspace harness operating inside an isolated "
+    "git worktree ({worktree_path}) on branch '{branch}' for workspace/repository '{repo}'.\n"
+    "CURRENT PHASE: PHASE 1 — ITERATIVE PLANNING, RESEARCH & TRADE-OFF ANALYSIS (READ-ONLY).\n"
+    "- Inspect the workspace files, codebase architecture, or primary research sources to design a concrete plan.\n"
+    "- Leverage your pre-installed Agent Skills (`agents-cli` skills, `brainstorming`, `writing-plans`, `research`, "
+    "`grill-me`, `code-review`, `doc-coauthoring`, `agent-browser`, or `npx -y skills find <query>` via `find-skills`) "
+    "and active GCP authentication (`$GOOGLE_CLOUD_PROJECT`) as needed.\n"
+    "- DO NOT modify, create, or delete workspace files, and DO NOT run mutating deployments (`agents-cli deploy`) during this phase.\n"
+    "- Produce a structured `plan_summary` (including key findings and rationale), ordered `steps` (explicitly noting any "
+    "proposed code changes, artifacts to generate, or cloud deployments), `files_to_modify`, and `questions` "
+    "(highlighting architectural trade-offs or approach options so the user can iterate on the plan with you before execution)."
 )
 
 EXECUTE_SYSTEM_PROMPT_TEMPLATE = (
-    "You are an autonomous software engineering harness operating inside an isolated git worktree "
-    "({worktree_path}) on branch '{branch}' for repository '{repo}'.\n"
+    "You are an autonomous software engineering, research, and workspace harness operating inside an isolated "
+    "git worktree ({worktree_path}) on branch '{branch}' for workspace/repository '{repo}'.\n"
     "CURRENT PHASE: PHASE 2 — AUTONOMOUS UNATTENDED EXECUTION.\n"
-    "- The user has approved the plan and provided any required steering direction.\n"
-    "- Execute the implementation end-to-end autonomously without asking for further interactive approvals.\n"
-    "- Write clean code, run relevant verification/tests inside the worktree, and provide a concise summary "
-    "of all changes applied."
+    "- The user has reviewed and locked the plan and provided any final steering direction.\n"
+    "- Execute the implementation, research synthesis, document generation, evaluation (`agents-cli eval`), or approved deployment "
+    "(`agents-cli deploy` against `$GOOGLE_CLOUD_PROJECT`) end-to-end autonomously.\n"
+    "- Leverage pre-installed Agent Skills (`executing-plans`, `test-driven-development`, `systematic-debugging`, "
+    "`verification-before-completion`, `doc-coauthoring`, `pdf`/`docx`/`xlsx`/`pptx`) to verify your work and produce "
+    "a clear summary of all changes applied or deliverables created."
 )
 
 
@@ -211,3 +217,37 @@ def extract_plan_from_json_output(
         inner.get("response") or inner.get("result") or default_summary
     ).strip()
     return str(session_id), text_summary or default_summary, default_questions, []
+
+
+def extract_plan_steps_from_json_output(raw_stdout: str) -> list[str]:
+    """Extract the ordered `steps` array from a harness JSON planning output envelope."""
+    if not raw_stdout or not raw_stdout.strip():
+        return []
+    for line in reversed([ln.strip() for ln in raw_stdout.strip().splitlines() if ln.strip()]):
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                continue
+            inner = (
+                payload.get("result")
+                if payload.get("event") == "result" and isinstance(payload.get("result"), dict)
+                else payload
+            )
+            structured = inner.get("structured_output")
+            if not isinstance(structured, dict):
+                raw_resp = inner.get("response") or inner.get("result")
+                if isinstance(raw_resp, str):
+                    try:
+                        parsed_resp = json.loads(raw_resp)
+                        if isinstance(parsed_resp, dict):
+                            structured = parsed_resp
+                    except json.JSONDecodeError:
+                        pass
+            if isinstance(structured, dict):
+                raw_steps = structured.get("steps")
+                if isinstance(raw_steps, list):
+                    return [str(s).strip() for s in raw_steps if str(s).strip()]
+            break
+        except json.JSONDecodeError:
+            continue
+    return []

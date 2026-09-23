@@ -19,6 +19,9 @@ def setup_function() -> None:
 
 
 def test_get_orchestrator_state_and_demo_a2ui_surfaces() -> None:
+    import time
+    from app.tasks import TaskHandle, get_task_registry
+
     res = client.get("/api/v1/state")
     assert res.status_code == 200
     data = res.json()
@@ -27,9 +30,20 @@ def test_get_orchestrator_state_and_demo_a2ui_surfaces() -> None:
     assert "workspace_connection" in data
     assert "secrets" in data
 
-    # Seed demo tasks and verify A2UI Plan Approval surface is synthesized
-    seed_res = client.post("/api/v1/tasks/demo")
-    assert seed_res.status_code == 200
+    # Register a task awaiting plan input and verify A2UI Plan Approval surface is synthesized
+    reg = get_task_registry()
+    reg._tasks["task-1"] = TaskHandle(
+        task_id="task-1",
+        goal="Upgrade JWT refresh token rotation in auth-svc",
+        repo="auth-svc",
+        started_at=time.monotonic(),
+        harness="claude",
+        mode="plan",
+        summary="Planned JWT refresh token upgrade for auth-svc.",
+        questions=["Rotate JWT via Redis TTL (Recommended)", "Stateless JWKS endpoint"],
+        awaiting_input=True,
+        _status="awaiting_input",
+    )
 
     state_after = client.get("/api/v1/state").json()
     assert state_after["task_counts"]["awaiting_input"] >= 1

@@ -77,9 +77,16 @@ export function App() {
 
   const state = serverState || FALLBACK_STATE;
 
-  const runningCount =
-    state.task_counts.running + state.task_counts.awaiting_input;
-  const awaitingCount = state.task_counts.awaiting_input;
+  const awaitingCount =
+    state.task_counts.awaiting_input + (state.task_counts.awaiting_approval || 0);
+  const runningCount = state.task_counts.running + awaitingCount;
+  const activeFleetCount = state.tasks.filter(
+    (t) =>
+      t.status === "running" ||
+      t.status === "awaiting_input" ||
+      t.status === "awaiting_approval" ||
+      !t.is_stale
+  ).length;
   const surfaceCount = state.a2ui_surfaces.length;
   const unreadyConnections = 0;
 
@@ -96,11 +103,8 @@ export function App() {
     }
   };
 
-  const handleSelectStarterPrompt = (prompt: string, isPlanDemo?: boolean) => {
+  const handleSelectStarterPrompt = (prompt: string) => {
     setIsStackCollapsed(false);
-    if (isPlanDemo) {
-      actions.seedDemoTasks.mutate();
-    }
     void liveAudio.startSession(prompt);
   };
 
@@ -143,6 +147,8 @@ export function App() {
               onClick={() => {
                 if (surfaceCount > 0) {
                   setIsStackCollapsed((prev) => !prev);
+                } else if (state.tasks.length > 0) {
+                  setFleetOpen((prev) => !prev);
                 } else {
                   setConfigOpen(true);
                 }
@@ -213,8 +219,8 @@ export function App() {
                 title="View background agent fleet"
               >
                 <Layers size={16} />
-                {state.tasks.length > 0 && (
-                  <span className="dock-badge">{state.tasks.length}</span>
+                {activeFleetCount > 0 && (
+                  <span className="dock-badge">{activeFleetCount}</span>
                 )}
               </button>
 
@@ -265,9 +271,11 @@ export function App() {
               state={state}
               onClose={() => setFleetOpen(false)}
               onApprovePlan={handleApprovePlan}
-              onCreateTask={(goal, repo, mode) =>
-                actions.createTask.mutate({ goal, repo, mode })
+              onDismissTask={(taskId) =>
+                actions.dismissSurface.mutate(`a2ui-${taskId}`)
               }
+              onCancelTask={(taskId) => actions.cancelTask.mutate(taskId)}
+              onClearHistory={() => actions.clearTasks.mutate()}
             />
           )}
 

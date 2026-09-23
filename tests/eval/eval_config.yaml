@@ -124,6 +124,8 @@ custom_metrics:
 
           required_all_map = {
               "plan_question_and_steer": ["dispatch_task", "get_task_result", "steer_task"],
+              "iterative_plan_refinement_and_execute": ["dispatch_task", "get_task_result", "steer_task"],
+              "generalist_research_synthesis_and_email_delivery": ["dispatch_task", "get_task_result", "gmail_messages"],
               "diff_gate_and_voice_approve": ["dispatch_task", "get_task_result", "approve_task"],
               "parallel_fleet_dispatch_and_status": ["dispatch_task", "list_tasks"],
               "cross_harness_handoff_in_worktree": ["dispatch_task", "get_task_result", "steer_task"],
@@ -192,6 +194,23 @@ custom_metrics:
               return {
                   "score": 1.0 if ok else 0.0,
                   "explanation": f"Parallel dispatches: {dispatches}" if ok else f"Expected >=2 dispatches for auth-svc and billing-svc, got {dispatches}",
+              }
+
+          if case_id == "iterative_plan_refinement_and_execute":
+              steers = [args for name, args in calls if name == "steer_task"]
+              modes = [str(a.get("mode", "execute")).lower() for a in steers]
+              ok = "plan" in modes and "execute" in modes
+              return {
+                  "score": 1.0 if ok else 0.0,
+                  "explanation": f"Iterative plan->execute steer modes: {modes}" if ok else f"Expected steer_task in both 'plan' and 'execute' modes, got {steers}",
+              }
+
+          if case_id == "generalist_research_synthesis_and_email_delivery":
+              gmails = [args for name, args in calls if name == "gmail_messages"]
+              ok = any("alex@example.com" in str(a.get("recipient", "")).lower() for a in gmails)
+              return {
+                  "score": 1.0 if ok else 0.0,
+                  "explanation": f"Delivered research output via gmail_messages: {gmails}" if ok else f"Expected gmail_messages to alex@example.com, got {gmails}",
               }
 
           if case_id == "cross_harness_handoff_in_worktree":

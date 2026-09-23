@@ -26,7 +26,13 @@ variable "project_id" {
 variable "region" {
   type        = string
   description = "Google Cloud region for resource deployment."
-  default     = "us-east1"
+  default     = "us-central1"
+}
+
+variable "db_tier" {
+  type        = string
+  description = "Machine tier for the Cloud SQL PostgreSQL instance."
+  default     = "db-custom-1-3840"
 }
 
 variable "telemetry_logs_filter" {
@@ -39,8 +45,11 @@ variable "app_sa_roles" {
   description = "List of roles to assign to the application service account"
   type        = list(string)
   default = [
-
     "roles/aiplatform.user",
+    "roles/cloudsql.client",
+    "roles/secretmanager.secretAccessor",
+    "roles/iam.serviceAccountTokenCreator",
+    "roles/run.invoker",
     "roles/logging.logWriter",
     "roles/cloudtrace.agent",
     "roles/storage.admin",

@@ -178,8 +178,26 @@ async def launch_detached_command(
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Launch a harness command detached inside the sandbox under `.sonar/runs/{run_id}/`."""
+    from app.auth import get_sandbox_gcp_env
+
+    merged_env = {**get_sandbox_gcp_env(), **(env or {})}
     run_dir = f"/workspace/.sonar/runs/{run_id}"
+    adc_prelude = ""
+    if merged_env.get("CLOUDSDK_AUTH_ACCESS_TOKEN") and not merged_env.get(
+        "GOOGLE_APPLICATION_CREDENTIALS"
+    ):
+        adc_prelude = (
+            'mkdir -p /workspace/.sonar && '
+            'printf \'#!/bin/sh\\necho "{\\"version\\":1,\\"success\\":true,\\"token_type\\":\\"urn:ietf:params:oauth:token-type:access_token\\",\\"access_token\\":\\"%s\\",\\"expiration_time\\":%s}"\\n\' '
+            '"$CLOUDSDK_AUTH_ACCESS_TOKEN" "$(( $(date +%s) + 3500 ))" > /workspace/.sonar/gcp_token.sh && '
+            'chmod +x /workspace/.sonar/gcp_token.sh && '
+            'printf \'{"type":"external_account","audience":"//iam.googleapis.com/projects/0/locations/global/workloadIdentityPools/sonar/providers/sandbox","subject_token_type":"urn:ietf:params:oauth:token-type:access_token","token_url":"https://sts.googleapis.com/v1/token","credential_source":{"executable":{"command":"/workspace/.sonar/gcp_token.sh"}}}\\n\' '
+            '> /workspace/.sonar/gcp_adc.json && '
+            'export GOOGLE_APPLICATION_CREDENTIALS=/workspace/.sonar/gcp_adc.json '
+            'GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1; '
+        )
     script = (
+        f"{adc_prelude}"
         f"mkdir -p {shlex.quote(run_dir)} {shlex.quote(worktree_path)} && "
         f"cd {shlex.quote(worktree_path)} && "
         f'echo \'{{"state":"running","started_at":\'$(date +%s)\'}}\' > {shlex.quote(run_dir)}/status.json && '
@@ -187,7 +205,7 @@ async def launch_detached_command(
         f'EC=$?; echo "{{\\"state\\":\\"completed\\",\\"exit_code\\":$EC,\\"ended_at\\":$(date +%s)}}" > {shlex.quote(run_dir)}/status.json) & '
         f"PID=$!; echo $PID > {shlex.quote(run_dir)}/pid"
     )
-    result = await exec_in_sandbox(context, script, env=env, timeout_s=15.0)
+    result = await exec_in_sandbox(context, script, env=merged_env, timeout_s=15.0)
     return {
         "run_id": run_id,
         "run_dir": run_dir,
@@ -669,7 +687,13 @@ def load_workspaces_manifest(local_override_path: Path | None = None) -> dict[st
     # Merge sandbox section
     base_sb = dict(base_data.get("sandbox") or {})
     local_sb = dict(local_data.get("sandbox") or {})
-    sandbox_list_keys = ("uv_tools", "python_packages", "npm_packages", "system_binaries")
+    sandbox_list_keys = (
+        "uv_tools",
+        "python_packages",
+        "npm_packages",
+        "skills",
+        "system_binaries",
+    )
     for list_key in sandbox_list_keys:
         if list_key in local_sb:
             combined = list(

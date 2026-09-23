@@ -128,6 +128,8 @@ def record_context_surface(
     brand_icon: str,
     badge: str,
     bullets: list[str],
+    items: list[dict[str, Any]] | None = None,
+    meta: dict[str, Any] | None = None,
     surface_id: str | None = None,
 ) -> None:
     """Records a live A2UI context surface from grounding, workspace, or MCP tool executions."""
@@ -157,6 +159,8 @@ def record_context_surface(
                 "brandIcon": brand_icon,
                 "badge": badge,
                 "bullets": bullets,
+                "items": items or [],
+                "meta": meta or {},
             }
         },
     }
@@ -199,20 +203,46 @@ def _build_task_milestones(handle: TaskHandle) -> list[dict[str, str]]:
             {"label": "Applied code changes & verified test suite", "state": "done"},
             {"label": handle.summary or "Changes committed automatically", "state": "done"},
         ]
+    if status == "failed":
+        return [
+            {"label": f"Dispatched {handle.harness} on {handle.repo}", "state": "done"},
+            {"label": handle.error or handle.summary or "Execution failed", "state": "active"},
+        ]
     return [
         {"label": f"Task {status} on {handle.repo}", "state": "done"},
     ]
 
 
+# Terminal tasks older than 10 minutes (600s) or explicitly dismissed move to the Ledger
+STALE_TERMINAL_SECONDS = 600
+
+
 def _serialize_task(handle: TaskHandle) -> dict[str, Any]:
+    import time
+
+    now_ts = time.time()
+    ref_ts = handle.ended_at_ts or handle.created_at_ts or now_ts
+    age_seconds = max(0, int(now_ts - ref_ts))
+    surface_id = f"a2ui-{handle.task_id}"
+    is_dismissed = surface_id in _dismissed_surfaces
+    is_terminal = handle.status in ("completed", "failed", "cancelled", "orphaned")
+    is_stale = bool(
+        is_terminal and (is_dismissed or age_seconds > STALE_TERMINAL_SECONDS)
+    )
     return {
         "task_id": handle.task_id,
         "goal": handle.goal,
         "repo": handle.repo,
         "harness": handle.harness,
         "mode": handle.mode,
+        "branch": handle.branch,
         "status": handle.status,
         "elapsed_seconds": handle.elapsed_seconds,
+        "created_at": handle.created_at_ts,
+        "ended_at": handle.ended_at_ts,
+        "age_seconds": age_seconds,
+        "is_dismissed": is_dismissed,
+        "is_stale": is_stale,
         "summary": handle.summary,
         "response_text": handle.response_text,
         "error": handle.error,
@@ -252,7 +282,7 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tid = t["task_id"]
         status = t["status"]
         surface_id = f"a2ui-{tid}"
-        if surface_id in _dismissed_surfaces:
+        if surface_id in _dismissed_surfaces or t.get("is_stale"):
             continue
 
         if status == "awaiting_approval":
@@ -412,6 +442,10 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ],
                     "dataModel": {
                         "outcome": {
+                            "status": status,
+                            "error": t.get("error"),
+                            "goal": t.get("goal"),
+                            "ageSeconds": t.get("age_seconds", 0),
                             "verification": verification,
                             "files": t.get("files_changed") or [],
                             "milestones": t["milestones"],
@@ -705,83 +739,21 @@ async def api_cancel_task(task_id: str) -> dict[str, Any]:
     return {"ok": True, "message": msg}
 
 
-@router.post("/tasks/demo")
-async def api_seed_demo_tasks() -> dict[str, Any]:
-    """Seeds interactive fleet tasks declaratively from `config/workspaces.yaml` (`demo_tasks`)."""
-    from app.workers.harnesses.base import (
-        ensure_repo_and_worktree,
-        load_workspaces_manifest,
-    )
-
+@router.post("/tasks/clear")
+@router.delete("/tasks")
+async def api_clear_tasks() -> dict[str, Any]:
+    """Clears all tasks from in-memory registry and durable TaskStore."""
     registry = get_task_registry()
+    await registry.clear_all()
+    count = 0
+    try:
+        from app.store.task_store import get_task_store
+
+        count = await get_task_store().clear_all_tasks()
+    except Exception:
+        pass
     _dismissed_surfaces.clear()
-    manifest = load_workspaces_manifest()
-    demo_specs = manifest.get("demo_tasks", [])
-
-    existing = await registry.list_all()
-    plan_spec = next(
-        (d for d in demo_specs if isinstance(d, dict) and d.get("mode") == "plan"),
-        None,
-    )
-    if plan_spec and not any(t.status == "awaiting_input" for t in existing):
-        repo_name = str(plan_spec.get("repo", "auth-svc"))
-        ensure_repo_and_worktree(repo_name, "demo-plan")
-
-        async def _plan_checkpoint_coro(tid: str, on_ev: Any) -> dict[str, Any]:
-            on_ev(f"Inspecting {repo_name} repository structure and planning options...")
-            await asyncio.sleep(0.05)
-            return {
-                "exit_code": 0,
-                "summary": str(plan_spec.get("summary", f"Planned changes for {repo_name}.")),
-                "response_text": str(plan_spec.get("response_text", "")),
-                "files_changed": list(plan_spec.get("files_changed", [])),
-                "questions": list(plan_spec.get("questions", [])),
-                "awaiting_input": True,
-            }
-
-        await registry.register(
-            goal=str(plan_spec.get("goal", "Upgrade service")),
-            repo=repo_name,
-            harness=str(plan_spec.get("harness", "claude")),
-            mode="plan",
-            task_coro_fn=_plan_checkpoint_coro,
-        )
-
-    exec_spec = next(
-        (d for d in demo_specs if isinstance(d, dict) and d.get("mode") == "execute"),
-        None,
-    )
-    if exec_spec and sum(1 for t in (await registry.list_all()) if t.status == "running") == 0:
-        repo_name = str(exec_spec.get("repo", "analytics-svc"))
-        ensure_repo_and_worktree(repo_name, "demo-exec")
-        steps = list(
-            exec_spec.get(
-                "steps",
-                [f"Inspecting {repo_name} modules...", f"Running test suite in {repo_name}..."],
-            )
-        )
-
-        async def _running_horizon_coro(tid: str, on_ev: Any) -> dict[str, Any]:
-            for s in steps:
-                on_ev(str(s))
-                await asyncio.sleep(8)
-            return {
-                "exit_code": 0,
-                "summary": str(exec_spec.get("summary", f"Completed optimization in {repo_name}.")),
-                "files_changed": list(exec_spec.get("files_changed", [])),
-                "awaiting_input": False,
-            }
-
-        await registry.register(
-            goal=str(exec_spec.get("goal", "Optimize service")),
-            repo=repo_name,
-            harness=str(exec_spec.get("harness", "horizon")),
-            mode="execute",
-            task_coro_fn=_running_horizon_coro,
-        )
-
-    await asyncio.sleep(0.1)
-    return {"ok": True, "message": "Seeded live fleet tasks from config/workspaces.yaml."}
+    return {"ok": True, "message": f"Cleared {count} tasks from database and registry."}
 
 
 @router.post("/a2ui/dismiss")

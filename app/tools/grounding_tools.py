@@ -109,13 +109,20 @@ async def search_web_grounded(query: str) -> str:
     try:
         from app.api_routes import record_context_surface
 
+        takeaways = _split_into_takeaways(answer)
         record_context_surface(
             kind="google_search",
             title="GOOGLE SEARCH · GROUNDED",
             subtitle=query,
             brand_icon="google_search",
             badge="Live Web",
-            bullets=_split_into_takeaways(answer),
+            bullets=takeaways,
+            items=[{"title": t, "kind": "search_takeaway"} for t in takeaways],
+            meta={
+                "query": query,
+                "summary": takeaways[0] if takeaways else answer[:240],
+                "source_url": f"https://www.google.com/search?q={query.replace(' ', '+')}",
+            },
             surface_id="a2ui-ctx-search",
         )
     except Exception:
@@ -148,13 +155,27 @@ async def search_maps_grounded(query: str, near_location: str = "San Francisco, 
     try:
         from app.api_routes import record_context_surface
 
+        takeaways = _split_into_takeaways(answer)
         record_context_surface(
             kind="google_maps",
             title="GOOGLE MAPS · PLACES",
             subtitle=f"{query} · {near_location}",
             brand_icon="google_maps",
             badge=near_location,
-            bullets=_split_into_takeaways(answer),
+            bullets=takeaways,
+            items=[
+                {
+                    "title": t,
+                    "location": near_location,
+                    "url": f"https://www.google.com/maps/search/{(query + ' ' + near_location).replace(' ', '+')}",
+                }
+                for t in takeaways
+            ],
+            meta={
+                "query": query,
+                "near_location": near_location,
+                "maps_url": f"https://www.google.com/maps/search/{(query + ' ' + near_location).replace(' ', '+')}",
+            },
             surface_id="a2ui-ctx-maps",
         )
     except Exception:

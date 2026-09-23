@@ -7,7 +7,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import delete, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.store.engine import get_session_factory
@@ -188,6 +188,33 @@ class TaskStore:
             await session.execute(stmt)
             await session.commit()
             return await self.get_task(record.id)
+
+    async def reconcile_orphaned_tasks(self) -> int:
+        """Marks any in-flight 'running' tasks from a previous server session as failed/interrupted."""
+        await self.ensure_initialized()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async with self._session_factory() as session:
+            stmt = (
+                update(TaskRecord)
+                .where(TaskRecord.status == "running")
+                .values(
+                    status="failed",
+                    summary="Task was interrupted by server shutdown or restart.",
+                    ended_at=now,
+                )
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            return res.rowcount or 0
+
+    async def clear_all_tasks(self) -> int:
+        """Purges all tasks, runs, events, and artifacts from the store."""
+        await self.ensure_initialized()
+        async with self._session_factory() as session:
+            stmt = delete(TaskRecord)
+            res = await session.execute(stmt)
+            await session.commit()
+            return res.rowcount or 0
 
     async def create_run(
         self,

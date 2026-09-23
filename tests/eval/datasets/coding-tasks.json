@@ -367,6 +367,130 @@
           }
         ]
       }
+    },
+    {
+      "eval_case_id": "iterative_plan_refinement_and_execute",
+      "agent_data": {
+        "agents": {
+          "voice_orchestrator": {
+            "agent_id": "voice_orchestrator",
+            "agent_type": "Agent",
+            "instruction": "Voice-driven engineering orchestrator."
+          }
+        },
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Start a task in plan mode on auth-svc using Claude Code to design a rotating token refresh flow and prepare a dev Cloud Run deployment."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 1,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Check the result of that task and walk me through the proposed plan summary, steps, and trade-offs."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 2,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Before we execute anything, steer that task in plan mode to revise the plan so it keeps Postgres as a fallback store alongside Redis."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 3,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Check the updated plan result, and now steer that task in execute mode to implement the changes and run the deployment."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "generalist_research_synthesis_and_email_delivery",
+      "agent_data": {
+        "agents": {
+          "voice_orchestrator": {
+            "agent_id": "voice_orchestrator",
+            "agent_type": "Agent",
+            "instruction": "Voice-driven engineering orchestrator."
+          }
+        },
+        "turns": [
+          {
+            "turn_index": 0,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Dispatch a task in execute mode on default-repo using Claude Code to research and synthesize a Mediterranean dinner menu for six people with a categorized shopping list."
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "turn_index": 1,
+            "events": [
+              {
+                "author": "user",
+                "content": {
+                  "role": "user",
+                  "parts": [
+                    {
+                      "text": "Get the result of that task and email the finished menu and shopping list to alex@example.com."
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
     }
   ]
 }

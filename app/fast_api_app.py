@@ -81,6 +81,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     try:
         await init_db()
+        from app.store.task_store import get_task_store
+
+        await get_task_store().reconcile_orphaned_tasks()
     except Exception:
         pass
 

@@ -150,10 +150,54 @@ async def spotify_playback(
                     artists = ", ".join(
                         a.get("name", "") for a in (item.get("artists") or [])
                     )
+                    album = (item.get("album") or {}).get("name") or ""
+                    images = (item.get("album") or {}).get("images") or []
+                    album_art = images[0].get("url") if images else None
+                    ext_url = (item.get("external_urls") or {}).get("spotify")
+                    device_name = (data.get("device") or {}).get("name") or "Spotify"
                     is_playing = data.get("is_playing", False)
                     if track_name:
                         state_word = "Currently playing" if is_playing else "Paused on"
+                        try:
+                            from app.api_routes import record_context_surface
+
+                            record_context_surface(
+                                kind="spotify",
+                                title=f"Spotify · {'Now Playing' if is_playing else 'Paused'}",
+                                subtitle=f"{track_name} — {artists}",
+                                brand_icon="spotify",
+                                badge=device_name,
+                                bullets=[f"{track_name} by {artists}" + (f" ({album})" if album else "")],
+                                meta={
+                                    "track": track_name,
+                                    "artist": artists,
+                                    "album": album,
+                                    "album_art_url": album_art,
+                                    "is_playing": is_playing,
+                                    "device_name": device_name,
+                                    "external_url": ext_url,
+                                    "status_label": "Now Playing" if is_playing else "Paused",
+                                },
+                                surface_id="a2ui-ctx-spotify",
+                            )
+                        except Exception:
+                            pass
                         return f"{state_word} {track_name} by {artists} on Spotify."
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="spotify",
+                            title="Spotify · Idle",
+                            subtitle="Connected — no active track loaded",
+                            brand_icon="spotify",
+                            badge="Idle",
+                            bullets=["Open Spotify on your phone or laptop to start playback."],
+                            meta={"status_label": "Idle · No Active Track", "empty_state": True},
+                            surface_id="a2ui-ctx-spotify",
+                        )
+                    except Exception:
+                        pass
                     return "Connected to Spotify, but no active track is loaded."
                 return f"Spotify API error ({r.status_code}): {r.text.strip()}"
 
@@ -163,6 +207,21 @@ async def spotify_playback(
                     headers=headers,
                 )
                 if r.status_code in {200, 204}:
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="spotify",
+                            title="Spotify · Playback Paused",
+                            subtitle="Paused on active device",
+                            brand_icon="spotify",
+                            badge="Paused",
+                            bullets=["Spotify playback paused on your active device."],
+                            meta={"status_label": "Playback Paused", "is_playing": False},
+                            surface_id="a2ui-ctx-spotify",
+                        )
+                    except Exception:
+                        pass
                     return "Paused Spotify playback on your active device."
                 return f"Spotify could not pause playback ({r.status_code}): {r.text.strip()}"
 
@@ -208,12 +267,42 @@ async def spotify_playback(
                 if act == "queue" and tracks:
                     uri = tracks[0]["uri"]
                     tname = tracks[0]["name"]
+                    artists = ", ".join(
+                        a.get("name", "") for a in (tracks[0].get("artists") or [])
+                    )
+                    album = (tracks[0].get("album") or {}).get("name") or ""
+                    images = (tracks[0].get("album") or {}).get("images") or []
+                    album_art = images[0].get("url") if images else None
+                    ext_url = (tracks[0].get("external_urls") or {}).get("spotify")
                     qr = await client.post(
                         "https://api.spotify.com/v1/me/player/queue",
                         params={"uri": uri},
                         headers=headers,
                     )
                     if qr.status_code in {200, 204}:
+                        try:
+                            from app.api_routes import record_context_surface
+
+                            record_context_surface(
+                                kind="spotify",
+                                title="Spotify · Added to Queue",
+                                subtitle=f"{tname} — {artists}",
+                                brand_icon="spotify",
+                                badge="Queued",
+                                bullets=[f"Queued {tname} by {artists}"],
+                                meta={
+                                    "track": tname,
+                                    "artist": artists,
+                                    "album": album,
+                                    "album_art_url": album_art,
+                                    "is_playing": True,
+                                    "external_url": ext_url,
+                                    "status_label": "Added to Queue",
+                                },
+                                surface_id="a2ui-ctx-spotify",
+                            )
+                        except Exception:
+                            pass
                         return f"Added {tname} to your Spotify playback queue."
                     return f"Spotify queue failed ({qr.status_code}): {qr.text.strip()}"
                 if tracks:
@@ -222,23 +311,77 @@ async def spotify_playback(
                     artists = ", ".join(
                         a.get("name", "") for a in (tracks[0].get("artists") or [])
                     )
+                    album = (tracks[0].get("album") or {}).get("name") or ""
+                    images = (tracks[0].get("album") or {}).get("images") or []
+                    album_art = images[0].get("url") if images else None
+                    ext_url = (tracks[0].get("external_urls") or {}).get("spotify")
                     pr = await client.put(
                         "https://api.spotify.com/v1/me/player/play",
                         json={"uris": [uri]},
                         headers=headers,
                     )
-                    if pr.status_code in {200, 204}:
+                    is_ok = pr.status_code in {200, 204}
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="spotify",
+                            title=f"Spotify · {'Now Playing' if is_ok else 'Track Matched'}",
+                            subtitle=f"{tname} — {artists}",
+                            brand_icon="spotify",
+                            badge="Playing" if is_ok else "Matched",
+                            bullets=[f"{tname} by {artists}" + (f" ({album})" if album else "")],
+                            meta={
+                                "track": tname,
+                                "artist": artists,
+                                "album": album,
+                                "album_art_url": album_art,
+                                "is_playing": is_ok,
+                                "external_url": ext_url,
+                                "status_label": "Now Playing" if is_ok else "Open Spotify Device to Play",
+                            },
+                            surface_id="a2ui-ctx-spotify",
+                        )
+                    except Exception:
+                        pass
+                    if is_ok:
                         return f"Now playing {tname} by {artists} on Spotify."
                     return f"Found {tname} by {artists}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
                 if playlists:
                     uri = playlists[0]["uri"]
                     pname = playlists[0]["name"]
+                    images = playlists[0].get("images") or []
+                    album_art = images[0].get("url") if images else None
+                    ext_url = (playlists[0].get("external_urls") or {}).get("spotify")
                     pr = await client.put(
                         "https://api.spotify.com/v1/me/player/play",
                         json={"context_uri": uri},
                         headers=headers,
                     )
-                    if pr.status_code in {200, 204}:
+                    is_ok = pr.status_code in {200, 204}
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="spotify",
+                            title=f"Spotify · {'Playlist Playing' if is_ok else 'Playlist Matched'}",
+                            subtitle=pname,
+                            brand_icon="spotify",
+                            badge="Playlist",
+                            bullets=[f"Playlist: {pname}"],
+                            meta={
+                                "track": pname,
+                                "artist": "Spotify Playlist",
+                                "album_art_url": album_art,
+                                "is_playing": is_ok,
+                                "external_url": ext_url,
+                                "status_label": "Playing Playlist" if is_ok else "Open Spotify Device to Play",
+                            },
+                            surface_id="a2ui-ctx-spotify",
+                        )
+                    except Exception:
+                        pass
+                    if is_ok:
                         return f"Now playing playlist {pname} on Spotify."
                     return f"Found playlist {pname}, but Spotify could not start playback ({pr.status_code}): {pr.text.strip()}"
                 return f"No matching tracks or playlists found on Spotify for {query.strip()}."
@@ -292,7 +435,31 @@ async def calendar_events(
                     headers=headers,
                 )
                 if r.status_code in {200, 201}:
-                    created_summary = (r.json() or {}).get("summary") or title
+                    ev_json = r.json() or {}
+                    created_summary = ev_json.get("summary") or title
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="google_calendar",
+                            title=f"Google Calendar · Scheduled",
+                            subtitle=created_summary,
+                            brand_icon="google_calendar",
+                            badge=prefs["tz_abbrev"],
+                            bullets=[f"{created_summary} · {time_window}"],
+                            items=[
+                                {
+                                    "title": created_summary,
+                                    "start_time": time_window,
+                                    "status": "Confirmed",
+                                    "meet_url": ev_json.get("hangoutLink") or ev_json.get("htmlLink"),
+                                }
+                            ],
+                            meta={"status_label": "Event Scheduled", "time_window": time_window},
+                            surface_id="a2ui-ctx-calendar",
+                        )
+                    except Exception:
+                        pass
                     return f"Scheduled {created_summary} on your Google Calendar for {time_window}."
                 if r.status_code in {401, 403}:
                     return (
@@ -318,32 +485,79 @@ async def calendar_events(
             if r.status_code == 200:
                 items = r.json().get("items") or []
                 if not items:
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="google_calendar",
+                            title=f"Google Calendar · {prefs['tz_abbrev']}",
+                            subtitle=f"Schedule clear for {time_window}",
+                            brand_icon="google_calendar",
+                            badge="Clear",
+                            bullets=[f"No upcoming events or conflicts for {time_window} ({prefs['timezone']})."],
+                            meta={
+                                "empty_state": True,
+                                "status_label": "Schedule Clear",
+                                "time_window": time_window,
+                                "tz_abbrev": prefs["tz_abbrev"],
+                            },
+                            surface_id="a2ui-ctx-calendar",
+                        )
+                    except Exception:
+                        pass
                     return f"You have no upcoming events on your Google Calendar for {time_window} ({prefs['timezone']})."
                 summaries = []
                 bullets = []
+                cal_items = []
                 for ev in items[:4]:
                     title = ev.get("summary") or "Untitled event"
                     raw_dt = (ev.get("start") or {}).get("dateTime")
+                    raw_end_dt = (ev.get("end") or {}).get("dateTime")
                     raw_date = (ev.get("start") or {}).get("date")
                     start_str = raw_dt or raw_date or ""
+                    start_short = raw_date or "All day"
+                    end_short = ""
+                    date_label = ""
                     if raw_dt:
                         try:
                             dt_obj = datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).astimezone(user_tz)
                             start_str = dt_obj.strftime(f"%a %b %-d at %-I:%M %p {prefs['tz_abbrev']}")
+                            start_short = dt_obj.strftime("%-I:%M %p")
+                            date_label = dt_obj.strftime("%a, %b %-d")
+                        except Exception:
+                            pass
+                    if raw_end_dt:
+                        try:
+                            end_obj = datetime.fromisoformat(raw_end_dt.replace("Z", "+00:00")).astimezone(user_tz)
+                            end_short = end_obj.strftime("%-I:%M %p")
                         except Exception:
                             pass
                     summaries.append(f"{title} ({start_str})")
                     bullets.append(f"{title} · {start_str}")
+                    cal_items.append(
+                        {
+                            "title": title,
+                            "start_time": start_short,
+                            "end_time": end_short,
+                            "date_label": date_label,
+                            "location": ev.get("location"),
+                            "meet_url": ev.get("hangoutLink") or ev.get("htmlLink"),
+                            "attendees_count": len(ev.get("attendees") or []),
+                        }
+                    )
                 try:
                     from app.api_routes import record_context_surface
 
                     record_context_surface(
                         kind="google_calendar",
                         title=f"Google Calendar · {prefs['tz_abbrev']}",
-                        subtitle=f"{len(items)} upcoming events ({prefs['timezone']})",
+                        subtitle=f"{len(items)} upcoming {'event' if len(items) == 1 else 'events'}",
                         brand_icon="google_calendar",
                         badge=prefs["tz_abbrev"],
                         bullets=bullets,
+                        items=cal_items,
+                        meta={"tz_abbrev": prefs["tz_abbrev"], "timezone": prefs["timezone"]},
+                        surface_id="a2ui-ctx-calendar",
                     )
                 except Exception:
                     pass
@@ -402,6 +616,27 @@ async def gmail_messages(
                     headers=headers,
                 )
                 if dr.status_code in {200, 201}:
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="gmail",
+                            title="Gmail · Draft Saved",
+                            subtitle=f"To: {to_str}",
+                            brand_icon="gmail",
+                            badge="Draft",
+                            bullets=[f"To: {to_str}", f"Subject: {subject_str}"],
+                            meta={
+                                "is_draft": True,
+                                "recipient": to_str,
+                                "subject": subject_str,
+                                "body": subject_str,
+                                "status_label": "Draft Saved",
+                            },
+                            surface_id="a2ui-ctx-gmail",
+                        )
+                    except Exception:
+                        pass
                     return f"Created a Gmail draft to {to_str} regarding {subject_str}."
                 return f"Gmail draft creation returned {dr.status_code}: {dr.text[:200]}"
 
@@ -413,12 +648,28 @@ async def gmail_messages(
             if r.status_code == 200:
                 msgs = r.json().get("messages") or []
                 if not msgs:
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="gmail",
+                            title=f"Gmail · {query or 'Inbox'}",
+                            subtitle="No matching threads found",
+                            brand_icon="gmail",
+                            badge="Inbox Clear",
+                            bullets=[f"No Gmail messages matching '{query}'."],
+                            meta={"empty_state": True, "status_label": "No Matching Messages", "query": query},
+                            surface_id="a2ui-ctx-gmail",
+                        )
+                    except Exception:
+                        pass
                     return f"No Gmail messages found matching '{query}'."
                 snippets = []
+                mail_items = []
                 for m in msgs[:4]:
                     mr = await client.get(
                         f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}",
-                        params={"format": "metadata", "metadataHeaders": ["Subject", "From"]},
+                        params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
                         headers=headers,
                     )
                     if mr.status_code == 200:
@@ -427,8 +678,21 @@ async def gmail_messages(
                             h["name"]: h["value"]
                             for h in (mdata.get("payload", {}).get("headers") or [])
                         }
-                        snippets.append(
-                            f"{hdrs.get('Subject', 'No Subject')} from {hdrs.get('From', 'Unknown')}"
+                        subj_val = hdrs.get("Subject", "No Subject")
+                        from_raw = hdrs.get("From", "Unknown")
+                        from_clean = from_raw.split("<")[0].strip().strip('"') or from_raw
+                        date_raw = hdrs.get("Date", "")
+                        snippets.append(f"{subj_val} from {from_raw}")
+                        mail_items.append(
+                            {
+                                "id": m["id"],
+                                "sender": from_clean,
+                                "from_raw": from_raw,
+                                "subject": subj_val,
+                                "snippet": str(mdata.get("snippet") or "").strip(),
+                                "date": date_raw[:16] if date_raw else "",
+                                "unread": "UNREAD" in (mdata.get("labelIds") or []),
+                            }
                         )
                 try:
                     from app.api_routes import record_context_surface
@@ -436,10 +700,13 @@ async def gmail_messages(
                     record_context_surface(
                         kind="gmail",
                         title=f"Gmail · {query or 'Inbox'}",
-                        subtitle=f"Top {len(snippets)} matching messages",
+                        subtitle=f"Top {len(snippets)} matching {'message' if len(snippets) == 1 else 'messages'}",
                         brand_icon="gmail",
                         badge="Gmail",
                         bullets=snippets,
+                        items=mail_items,
+                        meta={"query": query},
+                        surface_id="a2ui-ctx-gmail",
                     )
                 except Exception:
                     pass
@@ -494,13 +761,28 @@ async def drive_files(
                 params={
                     "q": q_param,
                     "pageSize": 5,
-                    "fields": "files(id,name,mimeType,modifiedTime,description)",
+                    "fields": "files(id,name,mimeType,modifiedTime,description,webViewLink)",
                 },
                 headers=headers,
             )
             if r.status_code == 200:
                 files = r.json().get("files") or []
                 if not files:
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="google_drive",
+                            title=f"Google Drive · {query or 'Files'}",
+                            subtitle="No matching files found",
+                            brand_icon="google_drive",
+                            badge="Drive",
+                            bullets=[f"No Google Drive files found matching '{query}'."],
+                            meta={"empty_state": True, "status_label": "No Matching Files"},
+                            surface_id="a2ui-ctx-drive",
+                        )
+                    except Exception:
+                        pass
                     return f"No Google Drive files found matching '{query}'."
                 names = [f["name"] for f in files[:5]]
                 descriptions = [
@@ -508,16 +790,45 @@ async def drive_files(
                     for f in files[:2]
                     if f.get("description")
                 ]
+                drive_items = []
+                for f in files[:5]:
+                    mime = str(f.get("mimeType") or "")
+                    if "spreadsheet" in mime:
+                        kind_label = "Sheet"
+                    elif "presentation" in mime:
+                        kind_label = "Slides"
+                    elif "document" in mime:
+                        kind_label = "Doc"
+                    elif "pdf" in mime:
+                        kind_label = "PDF"
+                    elif "folder" in mime:
+                        kind_label = "Folder"
+                    else:
+                        kind_label = "File"
+                    fid = f.get("id")
+                    drive_items.append(
+                        {
+                            "id": fid,
+                            "name": f.get("name"),
+                            "mime_type": mime,
+                            "kind_label": kind_label,
+                            "modified_time": str(f.get("modifiedTime") or "")[:10],
+                            "description": str(f.get("description") or "").strip(),
+                            "url": f.get("webViewLink") or (f"https://drive.google.com/file/d/{fid}/view" if fid else None),
+                        }
+                    )
                 try:
                     from app.api_routes import record_context_surface
 
                     record_context_surface(
                         kind="google_drive",
                         title=f"Google Drive · {query or 'Recent Files'}",
-                        subtitle=f"Found {len(names)} files in Google Drive",
+                        subtitle=f"Found {len(names)} {'file' if len(names) == 1 else 'files'} in Google Drive",
                         brand_icon="google_drive",
                         badge="Drive",
                         bullets=names,
+                        items=drive_items,
+                        surface_id="a2ui-ctx-drive",
                     )
                 except Exception:
                     pass
@@ -588,6 +899,21 @@ async def slack_messages(
                     headers=headers,
                 )
                 if pr.json().get("ok"):
+                    try:
+                        from app.api_routes import record_context_surface
+
+                        record_context_surface(
+                            kind="slack",
+                            title=f"Slack · #{cname}",
+                            subtitle="Message posted",
+                            brand_icon="slack",
+                            badge=f"#{cname}",
+                            bullets=[message.strip() or "Status update"],
+                            meta={"status_label": f"Posted to #{cname}", "channel": f"#{cname}"},
+                            surface_id="a2ui-ctx-slack",
+                        )
+                    except Exception:
+                        pass
                     return f"Posted your message to the {cname} channel on Slack."
                 return f"Failed to post to Slack channel {cname}: {pr.json().get('error')}."
             hr = await client.get(
@@ -599,6 +925,21 @@ async def slack_messages(
             msgs = [m.get("text", "") for m in (hdata.get("messages") or []) if m.get("text")]
             if not msgs:
                 return f"No recent messages in Slack channel {cname}."
+            try:
+                from app.api_routes import record_context_surface
+
+                record_context_surface(
+                    kind="slack",
+                    title=f"Slack · #{cname}",
+                    subtitle=f"Latest {len(msgs)} messages in #{cname}",
+                    brand_icon="slack",
+                    badge=f"#{cname}",
+                    bullets=msgs[:3],
+                    items=[{"channel": f"#{cname}", "text": t} for t in msgs[:3]],
+                    surface_id="a2ui-ctx-slack",
+                )
+            except Exception:
+                pass
             return f"Latest in Slack channel {cname}: {' | '.join(msgs[:2])}"
     except Exception as exc:
         return f"Error communicating with Slack API: {exc}"
@@ -719,6 +1060,16 @@ async def github_operations(
                     ]
                     feature_branches = [b for b in branches if b != "main"]
                     bullets = [f"Branch: {b}" for b in (feature_branches or branches)[:6]]
+                    branch_items = [
+                        {
+                            "kind": "branch",
+                            "title": b,
+                            "repo": fork_slug,
+                            "state": "active",
+                            "url": f"https://github.com/{fork_slug}/tree/{b}",
+                        }
+                        for b in (feature_branches or branches)[:5]
+                    ]
                     try:
                         from app.api_routes import record_context_surface
 
@@ -729,6 +1080,9 @@ async def github_operations(
                             brand_icon="github",
                             badge=fork_slug,
                             bullets=bullets,
+                            items=branch_items,
+                            meta={"fork": fork_slug, "branches": (feature_branches or branches)[:6]},
+                            surface_id="a2ui-ctx-github",
                         )
                     except Exception:
                         pass
@@ -755,6 +1109,32 @@ async def github_operations(
                             f"{w.get('name')}: {w.get('conclusion') or w.get('status')} on {w.get('head_branch')}"
                             for w in runs[:3]
                         ]
+                        ci_items = [
+                            {
+                                "kind": "ci",
+                                "title": w.get("name") or "Workflow",
+                                "repo": slug,
+                                "state": w.get("conclusion") or w.get("status") or "queued",
+                                "author": w.get("head_branch"),
+                                "url": w.get("html_url"),
+                            }
+                            for w in runs[:3]
+                        ]
+                        try:
+                            from app.api_routes import record_context_surface
+
+                            record_context_surface(
+                                kind="github_ci",
+                                title=f"GitHub Actions · {slug}",
+                                subtitle=f"Latest {len(ci_items)} CI workflow runs",
+                                brand_icon="github",
+                                badge=slug,
+                                bullets=summaries,
+                                items=ci_items,
+                                surface_id="a2ui-ctx-github",
+                            )
+                        except Exception:
+                            pass
                         return f"Latest GitHub Actions CI runs on {slug}: {'; '.join(summaries)}."
                 return f"No recent GitHub Actions CI runs found on {upstream_slug}."
 
@@ -774,6 +1154,34 @@ async def github_operations(
                             f"issue {i['number']}, {i['title']}"
                             for i in items[:3]
                         )
+                        issue_items = [
+                            {
+                                "kind": "issue",
+                                "number": i.get("number"),
+                                "title": i.get("title"),
+                                "repo": upstream_slug,
+                                "state": i.get("state", "open"),
+                                "author": (i.get("user") or {}).get("login"),
+                                "comments": i.get("comments", 0),
+                                "url": i.get("html_url"),
+                            }
+                            for i in items[:4]
+                        ]
+                        try:
+                            from app.api_routes import record_context_surface
+
+                            record_context_surface(
+                                kind="github_issues",
+                                title=f"GitHub Issues · {upstream_slug}",
+                                subtitle=f"{len(issue_items)} open issues",
+                                brand_icon="github",
+                                badge=upstream_slug,
+                                bullets=[f"#{i['number']}: {i['title']}" for i in items[:4]],
+                                items=issue_items,
+                                surface_id="a2ui-ctx-github",
+                            )
+                        except Exception:
+                            pass
                         return f"Open GitHub issues on {upstream_slug}: {spoken}."
                 return f"No open GitHub issues found on {upstream_slug}."
 
@@ -786,9 +1194,41 @@ async def github_operations(
                     )
                     if r.status_code == 200:
                         pr = r.json()
+                        author_login = (pr.get("user") or {}).get("login")
+                        head_label = (pr.get("head") or {}).get("label") or ""
+                        try:
+                            from app.api_routes import record_context_surface
+
+                            record_context_surface(
+                                kind="github_prs",
+                                title=f"GitHub PR #{pr['number']} · {slug}",
+                                subtitle=pr.get("title") or f"Pull Request #{pr['number']}",
+                                brand_icon="github",
+                                badge=slug,
+                                bullets=[
+                                    f"#{pr['number']}: {pr['title']} (@{author_login})",
+                                    f"State: {pr.get('state')} · Branch: {head_label}",
+                                ],
+                                items=[
+                                    {
+                                        "kind": "pr",
+                                        "number": pr.get("number"),
+                                        "title": pr.get("title"),
+                                        "repo": slug,
+                                        "state": "merged" if pr.get("merged") else pr.get("state", "open"),
+                                        "author": author_login,
+                                        "branch": head_label,
+                                        "comments": pr.get("comments", 0),
+                                        "url": pr.get("html_url"),
+                                    }
+                                ],
+                                surface_id="a2ui-ctx-github",
+                            )
+                        except Exception:
+                            pass
                         return (
-                            f"Pull request {pr['number']} on {slug} by {pr.get('user', {}).get('login')}: "
-                            f"{pr['title']} (state: {pr['state']}, branch: {pr.get('head', {}).get('label')})."
+                            f"Pull request {pr['number']} on {slug} by {author_login}: "
+                            f"{pr['title']} (state: {pr['state']}, branch: {head_label})."
                         )
 
             my_prs: list[dict[str, Any]] = []
@@ -844,6 +1284,7 @@ async def github_operations(
 
             parts: list[str] = []
             bullets: list[str] = []
+            gh_items: list[dict[str, Any]] = []
 
             if my_prs:
                 open_mine = [p for p in my_prs if p.get("state") == "open"]
@@ -855,8 +1296,21 @@ async def github_operations(
                     )
                     parts.append(f"Your open pull requests as {gh_user}: {mine_str}")
                     for p in open_mine[:3]:
+                        r_short = p["repository_url"].split("/")[-1]
                         bullets.append(
-                            f"[Open · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
+                            f"[Open · @{gh_user}] {r_short}#{p['number']}: {p['title']}"
+                        )
+                        gh_items.append(
+                            {
+                                "kind": "pr",
+                                "number": p.get("number"),
+                                "title": p.get("title"),
+                                "repo": r_short,
+                                "state": "open",
+                                "author": gh_user,
+                                "comments": p.get("comments", 0),
+                                "url": p.get("html_url"),
+                            }
                         )
                 if closed_mine:
                     recent_str = "; ".join(
@@ -865,8 +1319,21 @@ async def github_operations(
                     )
                     parts.append(f"Your recent pull requests: {recent_str}")
                     for p in closed_mine[:2]:
+                        r_short = p["repository_url"].split("/")[-1]
                         bullets.append(
-                            f"[Merged/Closed · @{gh_user}] {p['repository_url'].split('/')[-1]}#{p['number']}: {p['title']}"
+                            f"[Merged/Closed · @{gh_user}] {r_short}#{p['number']}: {p['title']}"
+                        )
+                        gh_items.append(
+                            {
+                                "kind": "pr",
+                                "number": p.get("number"),
+                                "title": p.get("title"),
+                                "repo": r_short,
+                                "state": "merged" if (p.get("pull_request") or {}).get("merged_at") else p.get("state", "closed"),
+                                "author": gh_user,
+                                "comments": p.get("comments", 0),
+                                "url": p.get("html_url"),
+                            }
                         )
 
             if fork_branches and fork_slug:
@@ -884,9 +1351,23 @@ async def github_operations(
                 )
                 parts.append(f"Latest upstream open PRs on {upstream_slug}: {up_str}")
                 for p in up_prs[:2]:
+                    u_login = (p.get("user") or {}).get("login")
                     bullets.append(
-                        f"[{upstream_slug}#{p['number']}] {p['title']} (@{p.get('user', {}).get('login')})"
+                        f"[{upstream_slug}#{p['number']}] {p['title']} (@{u_login})"
                     )
+                    if len(gh_items) < 5:
+                        gh_items.append(
+                            {
+                                "kind": "pr",
+                                "number": p.get("number"),
+                                "title": p.get("title"),
+                                "repo": upstream_slug.split("/")[-1],
+                                "state": p.get("state", "open"),
+                                "author": u_login,
+                                "comments": p.get("comments", 0),
+                                "url": p.get("html_url"),
+                            }
+                        )
 
             if bullets:
                 try:
@@ -900,6 +1381,14 @@ async def github_operations(
                         brand_icon="github",
                         badge=badge_label,
                         bullets=bullets[:5],
+                        items=gh_items[:5],
+                        meta={
+                            "user": gh_user,
+                            "fork": fork_slug,
+                            "upstream": upstream_slug,
+                            "branches": fork_branches[:5],
+                        },
+                        surface_id="a2ui-ctx-github",
                     )
                 except Exception:
                     pass

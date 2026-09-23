@@ -62,6 +62,8 @@ class SandboxWorker(WorkerBackend):
         self._http_transport = http_transport
         self._running_tasks: dict[str, Any] = {}
         self._repo_locks: dict[str, asyncio.Lock] = {}
+        self._sandbox_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._sandbox_resolve_lock = asyncio.Lock()
 
     def _get_repo_lock(self, repo_slug: str) -> asyncio.Lock:
         if repo_slug not in self._repo_locks:
@@ -74,6 +76,8 @@ class SandboxWorker(WorkerBackend):
 
     async def _ensure_sandbox(self, user_id: str = "default_user") -> dict[str, str]:
         """Finds or provisions the persistent per-user Vertex Agent Engine Sandbox container."""
+        import time
+
         if self._connection is not None:
             return self._connection
 
@@ -85,7 +89,37 @@ class SandboxWorker(WorkerBackend):
                 "sandbox_token": os.getenv("VERTEX_SANDBOX_TOKEN", ""),
             }
 
-        return await asyncio.to_thread(self._resolve_live_vertex_sandbox, user_id)
+        cached = self._sandbox_cache.get(user_id)
+        if cached is not None and (time.monotonic() - cached[0]) < 900.0:
+            return cached[1]
+
+        async with self._sandbox_resolve_lock:
+            cached = self._sandbox_cache.get(user_id)
+            if cached is not None and (time.monotonic() - cached[0]) < 900.0:
+                return cached[1]
+            info = await asyncio.to_thread(self._resolve_live_vertex_sandbox, user_id)
+            self._sandbox_cache[user_id] = (time.monotonic(), info)
+            return info
+
+    async def resolve_sandbox_context(
+        self,
+        user_id: str = "default_user",
+        *,
+        worktree_dir: Path | None = None,
+        branch: str | None = None,
+    ) -> SandboxContext:
+        """Resolve a live SandboxContext backed by the user's Vertex Agent Engine Sandbox."""
+        sandbox_info = await self._ensure_sandbox(user_id=user_id)
+        return SandboxContext(
+            user_id=user_id,
+            sandbox_name=sandbox_info["sandbox_name"],
+            lb_host=sandbox_info["lb_host"],
+            routing_token=sandbox_info["routing_token"],
+            sandbox_token=sandbox_info["sandbox_token"],
+            worktree_dir=worktree_dir,
+            branch=branch,
+            http_transport=self._http_transport,
+        )
 
     def _resolve_live_vertex_sandbox(self, user_id: str = "default_user") -> dict[str, str]:
         """Reattaches to or creates a live Vertex Agent Engine Sandbox in GCP dynamically."""
@@ -105,6 +139,10 @@ class SandboxWorker(WorkerBackend):
             f"lha-run@{sb_project}.iam.gserviceaccount.com",
         )
         pinned_sb = os.getenv("VERTEX_SANDBOX_RESOURCE_NAME", "").strip()
+        if not sb_project and not pinned_sb:
+            raise RuntimeError(
+                "Neither GOOGLE_CLOUD_PROJECT/SANDBOX_GCP_PROJECT nor VERTEX_SANDBOX_RESOURCE_NAME is configured."
+            )
         display_name = f"voice-worker-{user_id}"
 
         client = vertexai.Client(

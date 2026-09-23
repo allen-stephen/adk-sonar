@@ -153,6 +153,21 @@ class SandboxRuntimeProfile:
             f"npm install -g {quoted}"
         )
 
+    def agents_cli_setup_command(self) -> str:
+        """Install `google-agents-cli` bundled ADK skills across all sandbox harnesses."""
+        return (
+            f"{self.path_prelude()}"
+            "agents-cli setup --skip-auth --agent all || "
+            "uvx google-agents-cli setup --skip-auth --agent all"
+        )
+
+    def skills_install(self, skill_spec: str) -> str:
+        """Install an agent skill spec globally across all sandbox harnesses via `npx -y skills add`."""
+        return (
+            f"{self.path_prelude()}"
+            f"npx -y skills add {skill_spec.strip()} -g -a '*' -y"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "venv_path": self.venv_path,
@@ -281,11 +296,12 @@ def get_default_provision_recipe(
         manifest_spec = _manifest_sandbox_section().get("horizon_package_spec")
         pkg_spec = os.getenv("HORIZON_PACKAGE_SPEC") or manifest_spec or HORIZON_GITHUB_SPEC
         spawn_py = (
-            "import subprocess, os, sys; "
+            "import subprocess, os, sys, signal, time; "
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
             f"p = subprocess.Popen(['{prof.python_bin}', '-m', 'uvicorn', "
             f"'horizon.fast_api_app:app', '--host', '0.0.0.0', '--port', '{a2a_port}'], "
-            "start_new_session=True, stdout=open('/tmp/horizon-a2a.log', 'w'), "
-            "stderr=subprocess.STDOUT, close_fds=True); "
+            "stdin=subprocess.DEVNULL, stdout=open('/tmp/horizon-a2a.log', 'w'), "
+            "stderr=subprocess.STDOUT, start_new_session=True, close_fds=True); "
             "open('/tmp/horizon.pid', 'w').write(str(p.pid))"
         )
         return {
@@ -296,10 +312,11 @@ def get_default_provision_recipe(
                 prof.venv_bootstrap_command(),
                 prof.uv_pip_install(pkg_spec),
                 (
-                    "([ -f /tmp/horizon.pid ] && kill $(cat /tmp/horizon.pid) 2>/dev/null || true); "
+                    f"(curl -fsSL http://127.0.0.1:{a2a_port}/.well-known/agent-card.json >/dev/null 2>&1) || "
+                    "(([ -f /tmp/horizon.pid ] && kill $(cat /tmp/horizon.pid) 2>/dev/null || true); "
                     "LHA_ENVIRONMENT_BACKEND=local USE_IN_MEMORY_SESSION=true "
                     f"USE_IN_MEMORY_TASK_STORE=true APP_URL=http://127.0.0.1:{a2a_port} "
-                    f'python3 -c "{spawn_py}"'
+                    f'nohup python3 -c "{spawn_py}" >/dev/null 2>&1 & sleep 2)'
                 ),
             ],
         }
@@ -338,6 +355,7 @@ class SandboxProvisioner:
     def __init__(self) -> None:
         self._states: dict[tuple[str, str], HarnessProvisionStatus] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._profile_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._profiles: dict[str, SandboxRuntimeProfile] = {}
 
@@ -345,6 +363,11 @@ class SandboxProvisioner:
         if key not in self._locks:
             self._locks[key] = asyncio.Lock()
         return self._locks[key]
+
+    def _get_profile_lock(self, sandbox_name: str) -> asyncio.Lock:
+        if sandbox_name not in self._profile_locks:
+            self._profile_locks[sandbox_name] = asyncio.Lock()
+        return self._profile_locks[sandbox_name]
 
     def get_status(
         self,
@@ -390,27 +413,32 @@ class SandboxProvisioner:
         if cached is not None and not force_refresh:
             return cached
 
-        probe: dict[str, Any] = {}
-        code, output = await self._exec_in_sandbox(context, SANDBOX_PROBE_COMMAND)
-        if code == 0 and output.strip():
-            probe = parse_sandbox_probe(output)
-        else:
-            logger.warning(
-                "Sandbox runtime probe failed in %s (exit %s); "
-                "falling back to configured defaults: %s",
-                context.sandbox_name,
-                code,
-                output.strip()[:200],
-            )
+        async with self._get_profile_lock(context.sandbox_name):
+            cached = self._profiles.get(context.sandbox_name)
+            if cached is not None and not force_refresh:
+                return cached
 
-        profile = resolve_sandbox_runtime_profile(probe)
-        self._profiles[context.sandbox_name] = profile
-        logger.info(
-            "Resolved sandbox runtime profile for %s: %s",
-            context.sandbox_name,
-            profile.to_dict(),
-        )
-        return profile
+            probe: dict[str, Any] = {}
+            code, output = await self._exec_in_sandbox(context, SANDBOX_PROBE_COMMAND)
+            if code == 0 and output.strip():
+                probe = parse_sandbox_probe(output)
+            else:
+                logger.warning(
+                    "Sandbox runtime probe failed in %s (exit %s); "
+                    "falling back to configured defaults: %s",
+                    context.sandbox_name,
+                    code,
+                    output.strip()[:200],
+                )
+
+            profile = resolve_sandbox_runtime_profile(probe)
+            self._profiles[context.sandbox_name] = profile
+            logger.info(
+                "Resolved sandbox runtime profile for %s: %s",
+                context.sandbox_name,
+                profile.to_dict(),
+            )
+            return profile
 
 
     async def check_health(
@@ -440,6 +468,13 @@ class SandboxProvisioner:
                         last_err = f"A2A agent-card returned HTTP {resp.status_code}"
                 except Exception as exc:
                     last_err = f"A2A endpoint unreachable on port {context.a2a_port}: {exc}"
+                if context.http_transport is None:
+                    code, out = await self._exec_in_sandbox(
+                        context,
+                        f"curl -fsSL http://127.0.0.1:{context.a2a_port}/.well-known/agent-card.json >/dev/null",
+                    )
+                    if code == 0:
+                        return True, None
                 await asyncio.sleep(2.0)
             return False, last_err
 
@@ -451,6 +486,29 @@ class SandboxProvisioner:
         return False, output or f"Health probe failed with exit code {code}"
 
 
+    async def _resolve_context(
+        self, context: SandboxContext | None = None
+    ) -> SandboxContext:
+        """Resolve an active SandboxContext when callers omit `context` (e.g. harness switch warm-up)."""
+        if context is not None:
+            return context
+        if os.getenv("ORCHESTRATOR_SKIP_STARTUP_WARMUP", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return SandboxContext()
+        try:
+            from app.workers.factory import get_worker_backend
+            from app.workers.sandbox import SandboxWorker
+
+            worker = get_worker_backend()
+            if isinstance(worker, SandboxWorker):
+                return await worker.resolve_sandbox_context()
+        except Exception as exc:
+            logger.debug("Could not resolve live Vertex Sandbox context: %s", exc)
+        return SandboxContext()
+
     async def ensure_provisioned(
         self,
         harness: CodingHarness,
@@ -461,7 +519,7 @@ class SandboxProvisioner:
         task_id: str = "preflight",
     ) -> HarnessProvisionStatus:
         """Single-flight preflight gate: ensures the harness is provisioned with the latest version before execution."""
-        ctx = context or SandboxContext()
+        ctx = await self._resolve_context(context)
         key = (ctx.sandbox_name, harness.name)
         lock = self._get_lock(key)
 
@@ -561,19 +619,26 @@ class SandboxProvisioner:
         context: SandboxContext | None = None,
     ) -> asyncio.Task[HarnessProvisionStatus] | None:
         """Trigger eager non-blocking background provisioning when a user switches harnesses."""
+        if context is None and os.getenv("ORCHESTRATOR_SKIP_STARTUP_WARMUP", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return None
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return None
 
         async def _runner() -> HarnessProvisionStatus:
+            resolved_ctx = await self._resolve_context(context)
             try:
-                return await self.ensure_provisioned(harness, context)
+                return await self.ensure_provisioned(harness, resolved_ctx)
             except Exception as exc:
                 logger.warning("Background warm-up for %s failed: %s", harness.name, exc)
                 return self.get_status(
                     harness.name,
-                    (context or SandboxContext()).sandbox_name,
+                    resolved_ctx.sandbox_name,
                 )
 
         task = loop.create_task(_runner(), name=f"warmup-{harness.name}")

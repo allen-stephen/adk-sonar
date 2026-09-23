@@ -165,13 +165,16 @@ def ensure_gcp_apis_and_iam(project_id: str | None = None) -> None:
         return
 
     acct = _run_quiet(["gcloud", "config", "get-value", "account"])
-    print(f"✓ Verifying GCP APIs (Vertex AI, IAM Credentials, Calendar, Gmail, Drive) on project '{proj}'...")
+    print(f"✓ Verifying GCP APIs (Vertex AI, Cloud Run, Cloud Build, Artifact Registry, IAM Credentials, Calendar, Gmail, Drive) on project '{proj}'...")
     subprocess.run(
         [
             "gcloud",
             "services",
             "enable",
             "aiplatform.googleapis.com",
+            "run.googleapis.com",
+            "cloudbuild.googleapis.com",
+            "artifactregistry.googleapis.com",
             "iamcredentials.googleapis.com",
             "calendar-json.googleapis.com",
             "gmail.googleapis.com",
@@ -568,6 +571,7 @@ async def provision_shared_sandbox(
     uv_tools = list(sandbox_cfg.get("uv_tools", []))
     py_pkgs = list(sandbox_cfg.get("python_packages", []))
     npm_pkgs = list(sandbox_cfg.get("npm_packages", []))
+    skills = list(sandbox_cfg.get("skills", []))
     sys_bins = list(sandbox_cfg.get("system_binaries", []))
 
     if manifest.get("default_harness"):
@@ -649,6 +653,8 @@ async def provision_shared_sandbox(
         install_steps.append((f"{len(py_pkgs)} python packages", profile.uv_pip_install(py_pkgs)))
     if npm_pkgs:
         install_steps.append((f"{len(npm_pkgs)} npm packages", profile.npm_global_install(npm_pkgs)))
+    install_steps.append(("agents-cli ADK skills", profile.agents_cli_setup_command()))
+    install_steps += [(f"skill pack ({s.split()[0]})", profile.skills_install(s)) for s in skills]
 
     for label, cmd in install_steps:
         code, output = await provisioner._exec_in_sandbox(context, cmd)
@@ -697,6 +703,7 @@ async def provision_shared_sandbox(
         "uv_tools": uv_tools,
         "python_packages": py_pkgs,
         "npm_packages": npm_pkgs,
+        "skills": skills,
         "system_binaries": sys_bins,
         "secrets": secret_status,
         "harnesses": harness_statuses,
@@ -888,6 +895,12 @@ def main() -> None:
         help="Cloud Run region when using --sync-cloud-run (default: us-central1).",
     )
     parser.add_argument(
+        "--check-only",
+        dest="check",
+        action="store_true",
+        help="Alias for --check (verify environment and live API readiness without modifying files).",
+    )
+    parser.add_argument(
         "--onboard",
         action="store_true",
         help="Run the onboarding wizard (interactive in a TTY, or non-interactive with --yes / flags) to write config/workspaces.local.yaml.",
@@ -895,8 +908,20 @@ def main() -> None:
     parser.add_argument(
         "--yes",
         "-y",
+        "--non-interactive",
+        dest="yes",
         action="store_true",
         help="Non-interactive mode: accept auto-discovered defaults + CLI flags without blocking on stdin.",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Optional GCP project override.",
+    )
+    parser.add_argument(
+        "--location",
+        default=None,
+        help="Optional GCP location override (default: us-central1).",
     )
     parser.add_argument(
         "--github-user",

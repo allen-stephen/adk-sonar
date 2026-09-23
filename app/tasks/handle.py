@@ -33,6 +33,8 @@ class TaskHandle:
     raw_diff: str | None = None
     pending_action: str | None = None
     approved_at: float | None = None
+    created_at_ts: float = field(default_factory=time.time)
+    ended_at_ts: float | None = None
     latest_update: str | None = None
     events: list[str] = field(default_factory=list)
     _status: str | None = None
@@ -124,12 +126,14 @@ def apply_result_to_handle(handle: TaskHandle, result: Any) -> None:
 
     if handle.error or (handle.exit_code is not None and handle.exit_code != 0):
         handle.status = "failed"
+        handle.ended_at_ts = time.time()
     elif handle.awaiting_input or handle.questions:
         handle.status = "awaiting_input"
     elif handle.awaiting_approval:
         handle.status = "awaiting_approval"
     else:
         handle.status = "completed"
+        handle.ended_at_ts = time.time()
 
 
 # Backward-compatibility alias

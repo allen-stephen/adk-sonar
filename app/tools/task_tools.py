@@ -343,7 +343,11 @@ async def watch_tasks() -> AsyncGenerator[str, None]:
         if handle:
             if handle.status == "awaiting_input":
                 q_str = " ".join(handle.questions)
-                yield f"{handle.task_id} on {handle.harness} finished planning for {handle.repo} and has questions: {q_str}"
+                summary_part = f" Plan summary: {handle.summary}." if handle.summary else ""
+                yield (
+                    f"{handle.task_id} on {handle.harness} finished planning for {handle.repo}"
+                    f"{summary_part} and has questions: {q_str}"
+                )
             elif handle.status == "awaiting_approval":
                 diff_str = handle.diff_summary or "Changes are ready."
                 yield f"{handle.task_id} on {handle.harness} has changes ready on branch {handle.branch}. {diff_str} Ready for your approval to commit and push."

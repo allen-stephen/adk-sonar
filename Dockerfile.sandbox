@@ -1,0 +1,78 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Custom Vertex AI Agent Engine Sandbox image with pre-installed coding harnesses,
+# ADK & Google Cloud SDKs, MCP stdio servers, and curated Agent Skills.
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/workspace/.sonar-venv \
+    NPM_CONFIG_PREFIX=/root/.local \
+    PATH="/root/.local/bin:/workspace/.sonar-venv/bin:/root/.local/share/uv/tools/google-agents-cli/bin:${PATH}"
+
+# 1. System CLI binaries & Node.js 22 LTS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    gnupg \
+    jq \
+    ripgrep \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Install uv & uvx
+COPY --from=ghcr.io/astral-sh/uv:0.8.13 /uv /uvx /bin/
+
+WORKDIR /workspace
+
+# 3. Bootstrap shared Python virtual environment & core packages
+RUN uv venv "${VIRTUAL_ENV}" && \
+    uv tool install google-agents-cli && \
+    uv pip install --upgrade \
+      "google-adk[mcp,a2a,eval,gcp,otel-gcp]>=2.8.0" \
+      "google-genai>=1.0.0" \
+      "google-agents-cli" \
+      "google-cloud-aiplatform[evaluation]>=1.156.0" \
+      "a2a-sdk[http-server]>=1.0.0" \
+      "mcp>=1.8.0" \
+      "fastapi>=0.115.0" \
+      "uvicorn[standard]>=0.34.0" \
+      "httpx>=0.28.0" \
+      "pydantic>=2.10.0" \
+      "pytest>=9.0.0" \
+      "pytest-asyncio>=1.0.0" \
+      "ruff>=0.9.0" \
+      "codespell>=2.2.0"
+
+# 4. Pre-install Coding Harnesses & stdio MCP servers
+RUN mkdir -p "${NPM_CONFIG_PREFIX}/bin" && \
+    npm install -g \
+      "@anthropic-ai/claude-code@latest" \
+      "@modelcontextprotocol/server-slack" \
+      "@modelcontextprotocol/server-github" \
+      "@modelcontextprotocol/server-filesystem" && \
+    (curl -fsSL https://antigravity.google/cli/install.sh | bash || true)
+
+# 5. Pre-install ADK & Generalist Agent Skills across all sandbox harnesses
+RUN agents-cli setup --skip-auth --agent all && \
+    npx -y skills add vercel-labs/skills --skill find-skills -g -a '*' -y && \
+    npx -y skills add obra/superpowers --skill brainstorming writing-plans executing-plans systematic-debugging test-driven-development verification-before-completion requesting-code-review -g -a '*' -y && \
+    npx -y skills add mattpocock/skills --skill research grill-me to-spec code-review diagnosing-bugs triage -g -a '*' -y && \
+    npx -y skills add anthropics/skills --skill doc-coauthoring pdf docx xlsx pptx webapp-testing mcp-builder -g -a '*' -y && \
+    npx -y skills add vercel-labs/agent-browser --skill agent-browser -g -a '*' -y

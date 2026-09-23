@@ -574,5 +574,105 @@ def test_onboarding_wizard_and_local_fork_override(
     assert "github.com/dev-alice/adk-samples.git" in recipe["source_url"]
 
 
+@pytest.mark.asyncio
+async def test_sandbox_skills_gcp_auth_and_iterative_plan_steering(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify sandbox skills manifest, GCP credential injection, plan steps extraction, and multi-turn mode='plan' steering."""
+    from app.agent import steer_task
+    from app.auth import get_sandbox_gcp_env
+    from app.workers.harnesses.base import (
+        SandboxContext,
+        launch_detached_command,
+        load_workspaces_manifest,
+    )
+    from app.workers.harnesses.prompts import extract_plan_steps_from_json_output
+    from app.workers.harnesses.provisioner import SandboxRuntimeProfile
+
+    # 1. Verify sandbox skills in workspaces.yaml and SandboxRuntimeProfile helpers
+    manifest = load_workspaces_manifest()
+    skills = manifest.get("sandbox", {}).get("skills", [])
+    assert any("vercel-labs/skills --skill find-skills" in s for s in skills)
+    assert any("obra/superpowers" in s for s in skills)
+    assert any("mattpocock/skills" in s for s in skills)
+
+    prof = SandboxRuntimeProfile()
+    assert "agents-cli setup --skip-auth --agent all" in prof.agents_cli_setup_command()
+    assert (
+        "npx -y skills add vercel-labs/skills --skill find-skills -g -a '*' -y"
+        in prof.skills_install("vercel-labs/skills --skill find-skills")
+    )
+
+    # 2. Verify GCP auth bridge injects project and token into harness env and detached commands
+    monkeypatch.setenv("SANDBOX_GCP_PROJECT", "sonar-prod-123")
+    monkeypatch.setenv("SANDBOX_GCP_ACCESS_TOKEN", "ya29.test-sandbox-token")
+    gcp_env = get_sandbox_gcp_env()
+    assert gcp_env["GOOGLE_CLOUD_PROJECT"] == "sonar-prod-123"
+    assert gcp_env["CLOUDSDK_CORE_PROJECT"] == "sonar-prod-123"
+    assert gcp_env["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "ya29.test-sandbox-token"
+
+    captured_reqs: list[httpx.Request] = []
+    ctx = SandboxContext(
+        http_transport=exec_transport(exit_code=0, requests=captured_reqs)
+    )
+    await launch_detached_command(
+        ctx,
+        "agents-cli deploy",
+        run_id="run-gcp-1",
+        worktree_path="/workspace/auth-svc",
+    )
+    assert len(captured_reqs) == 1
+    sent_payload = json.loads(captured_reqs[0].content)
+    assert sent_payload["env"]["GOOGLE_CLOUD_PROJECT"] == "sonar-prod-123"
+    assert sent_payload["env"]["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "ya29.test-sandbox-token"
+    assert "/workspace/.sonar/gcp_adc.json" in sent_payload["command"]
+
+    # 3. Verify plan steps extraction and iterative mode='plan' steering before mode='execute'
+    raw_plan = json.dumps(
+        {
+            "session_id": "sess-iter-1",
+            "structured_output": {
+                "plan_summary": "Compare Redis vs Postgres for session state.",
+                "steps": ["Inspect current session store", "Benchmark Redis TTL"],
+                "questions": ["Should we keep Postgres as a fallback?"],
+                "files_to_modify": ["app/store.py"],
+            },
+        }
+    )
+    assert extract_plan_steps_from_json_output(raw_plan) == [
+        "Inspect current session store",
+        "Benchmark Redis TTL",
+    ]
+
+    register_fake_harnesses(
+        "claude",
+        questions=["What TTL should we use for the revised Redis plan?"],
+        summary="Revised Plan v2 with Redis primary and Postgres fallback.",
+    )
+    install_worker(
+        monkeypatch,
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=sandbox_transport(exec_exit_code=0),
+        ),
+    )
+    await dispatch_task(goal="Design session store", repo="auth-svc", mode="plan", harness="claude")
+    h = await get_task_registry().get("task-1")
+    assert h is not None
+    await h.async_task
+    assert h.status == "awaiting_input"
+
+    # Iterate on the plan in mode='plan' (Plan v1 -> Plan v2)
+    steer_plan_msg = await steer_task(
+        task_id="task-1",
+        instruction="Keep Postgres as fallback and revise the plan steps",
+        mode="plan",
+    )
+    assert "in plan mode" in steer_plan_msg
+    await h.async_task
+    assert h.status == "awaiting_input"
+    assert h.mode == "plan"
+
+
 
 

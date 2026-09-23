@@ -56,6 +56,14 @@ sandbox:
     - "@modelcontextprotocol/server-github"
     - "@modelcontextprotocol/server-filesystem"
 
+  # Pre-installed Agent Skills inside the sandbox container (`agents-cli setup --skip-auth --agent all` + `npx -y skills add <spec> -g -a '*' -y`)
+  skills:
+    - "vercel-labs/skills --skill find-skills"
+    - "obra/superpowers --skill brainstorming writing-plans executing-plans systematic-debugging test-driven-development verification-before-completion requesting-code-review"
+    - "mattpocock/skills --skill research grill-me to-spec code-review diagnosing-bugs triage"
+    - "anthropics/skills --skill doc-coauthoring pdf docx xlsx pptx webapp-testing mcp-builder"
+    - "vercel-labs/agent-browser --skill agent-browser"
+
   # System CLI binaries verified/installed in the sandbox for codebase search & GitHub PR workflows
   system_binaries:
     - "git"
@@ -65,11 +73,17 @@ sandbox:
     - "curl"
 
   shared_context_rules: |
-    # Shared Sandbox Engineering Rules (Synchronized to AGENTS.md, CLAUDE.md, and GEMINI.md)
+    # Shared Sandbox Engineering & Workspace Rules (Synchronized to AGENTS.md, CLAUDE.md, and GEMINI.md)
     - This workspace is shared across Claude Code (`claude`), Antigravity (`agy`), and ADK Long Horizon (`horizon`).
     - Pre-installed SDKs & CLIs available in this sandbox: `google-adk` (`adk`), `google-genai`, `google-agents-cli` (`agents-cli`), `a2a-sdk`, `mcp`, `pytest`, `ruff`, `ty`, `gh`, `rg`, and `jq`.
+    - Pre-installed Agent Skills across all harnesses:
+      1. ADK & Cloud Deployment (`agents-cli` skills: `adk-code`, `workflow`, `eval`, `deploy`, `observability`, `publish`, `scaffold`).
+      2. Dynamic Skill Discovery (`find-skills`: run `npx -y skills find <query>` and `npx -y skills add <pkg> -g -a '*' -y` to install new skills on demand).
+      3. Iterative Planning & Rigor (`brainstorming`, `writing-plans`, `executing-plans`, `grill-me`, `to-spec`, `systematic-debugging`, `test-driven-development`, `verification-before-completion`, `code-review`, `triage`).
+      4. Deep Research & Document Deliverables (`research`, `agent-browser`, `doc-coauthoring`, `pdf`, `docx`, `xlsx`, `pptx`, `webapp-testing`, `mcp-builder`).
+    - GCP Project & Deployment Authentication: The sandbox is authenticated to the active GCP project (`$GOOGLE_CLOUD_PROJECT`). In `mode="plan"`, you may run read-only inspection or `agents-cli eval`, and must explicitly list any proposed `agents-cli deploy` or `gcloud` mutations in the plan steps for user approval before running them in `mode="execute"`.
     - Always preserve existing git worktree branches (`agent/<task_id>`) and uncommitted modifications left by prior harness turns.
-    - Keep changes modular, run `pytest` and `ruff check` when tests are present, and leave a concise summary of modified files.
+    - Keep changes modular, run `pytest` and `ruff check` when tests are present, and leave a concise summary of modified files or generated artifacts.
 
 repositories:
   - name: "agents-cli"
@@ -159,29 +173,3 @@ seed_repositories:
 
         def test_flush_telemetry_batch():
             assert flush_telemetry_batch([{"id": 1}, {"id": 2}]) == 2
-
-demo_tasks:
-  - goal: "Upgrade JWT refresh token rotation in auth-svc"
-    repo: "auth-svc"
-    harness: "claude"
-    mode: "plan"
-    summary: "Planned JWT refresh token upgrade for auth-svc. Ready for your approval."
-    response_text: "I inspected auth-svc and drafted the JWT rotation plan. Which token storage strategy should we execute?"
-    files_changed:
-      - "src/auth/jwt.py"
-      - "src/cache/redis_store.py"
-    questions:
-      - "Rotate JWT via Redis TTL (Recommended)"
-      - "Stateless JWKS endpoint with 15m grace window"
-  - goal: "Optimize BigQuery telemetry batching latency in analytics-svc"
-    repo: "analytics-svc"
-    harness: "horizon"
-    mode: "execute"
-    summary: "Optimized BigQuery telemetry batching latency by 38% in analytics-svc."
-    files_changed:
-      - "src/pipeline/batcher.py"
-      - "tests/test_batcher.py"
-    steps:
-      - "Inspecting analytics-svc event pipeline modules..."
-      - "Synthesizing BigQuery batching optimization..."
-      - "Running pytest suite across 14 event pipeline modules..."

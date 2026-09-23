@@ -83,6 +83,15 @@ class TaskRecord(Base):
         from app.tasks import TaskHandle
 
         events = list(self.events_list or [])
+        created_ts = (
+            self.created_at.timestamp() if self.created_at is not None else time.time()
+        )
+        ended_dt = self.ended_at or (
+            self.updated_at
+            if self.status in {"completed", "failed", "cancelled", "orphaned"}
+            else None
+        )
+        ended_ts = ended_dt.timestamp() if ended_dt is not None else None
         return TaskHandle(
             task_id=self.short_id,
             goal=self.goal,
@@ -105,6 +114,8 @@ class TaskRecord(Base):
             diff_summary=self.diff_summary,
             raw_diff=self.raw_diff,
             pending_action=self.pending_action,
+            created_at_ts=created_ts,
+            ended_at_ts=ended_ts,
             latest_update=events[-1] if events else self.summary,
             events=events,
             _status=self.status,

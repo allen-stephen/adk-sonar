@@ -151,7 +151,10 @@ class ClaudeCodeHarness:
         )
 
     def build_env(self) -> dict[str, str]:
+        from app.auth import get_sandbox_gcp_env
+
         return {
+            **get_sandbox_gcp_env(),
             "CLAUDE_CODE_USE_VERTEX": os.getenv("CLAUDE_CODE_USE_VERTEX", "1"),
             "ANTHROPIC_VERTEX_PROJECT_ID": os.getenv(
                 "ANTHROPIC_VERTEX_PROJECT_ID",
@@ -245,6 +248,8 @@ class ClaudeCodeHarness:
                     f"{exec_result.exit_code}. {exec_result.stderr.strip()[:300]}",
                     exec_result.exit_code,
                 )
+            from app.workers.harnesses.prompts import extract_plan_steps_from_json_output
+
             parsed_sess, plan_summary, questions, _files = extract_plan_from_json_output(
                 exec_result.stdout,
                 fallback_session_id=sess_id,
@@ -252,26 +257,32 @@ class ClaudeCodeHarness:
                 repo=repo,
                 display_name=self.display_name,
             )
+            plan_steps = extract_plan_steps_from_json_output(exec_result.stdout)
+            full_plan_text = (
+                f"{plan_summary} Steps: {'; '.join(plan_steps)}"
+                if plan_steps
+                else plan_summary
+            )
             if on_event:
                 on_event(
                     HarnessEvent(
                         task_id=task_id,
                         harness=self.name,
                         kind="approval_needed",
-                        message=plan_summary,
+                        message=full_plan_text,
                     )
                 )
             return WorkerExecutionResult(
                 exit_code=0,
                 summary=plan_summary,
-                response_text=plan_summary,
+                response_text=full_plan_text,
                 claude_session_id=parsed_sess,
                 questions=questions,
                 awaiting_input=True,
                 branch=branch,
                 worktree_path=wt_path,
                 harness=self.name,
-                events=[plan_summary],
+                events=[plan_summary, *plan_steps],
             )
 
         events_log: list[str] = []

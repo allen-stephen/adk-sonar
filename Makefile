@@ -41,7 +41,15 @@ sync-secrets:
 provision:
 	uv sync
 	@[ -d web/node_modules ] || npm --prefix web install
-	uv run python scripts/provision_sandbox.py
+	uv run python scripts/provision_sandbox.py --non-interactive
+
+# Alias to reprovision the live Vertex AI Agent Engine Sandbox with pre-installed skills & GCP auth
+sandbox:
+	uv run python scripts/provision_sandbox.py --non-interactive
+
+# Build and push the custom Vertex Sandbox container image (Dockerfile.sandbox) to Artifact Registry
+sandbox-image:
+	gcloud builds submit --tag us-central1-docker.pkg.dev/$${GOOGLE_CLOUD_PROJECT}/sonar/sandbox:latest -f Dockerfile.sandbox .
 
 # Run unit and integration tests
 test:

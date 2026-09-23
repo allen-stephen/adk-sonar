@@ -21,3 +21,13 @@ output "logs_bucket_name" {
   description = "Logs storage bucket name"
   value       = google_storage_bucket.logs_data_bucket.name
 }
+
+output "cloudsql_instance_connection_name" {
+  description = "Cloud SQL PostgreSQL instance connection name mounted at /cloudsql in Cloud Run"
+  value       = google_sql_database_instance.postgres.connection_name
+}
+
+output "task_db_url_secret_id" {
+  description = "Secret Manager secret ID storing the SQLAlchemy asyncpg TASK_DB_URL"
+  value       = google_secret_manager_secret.task_db_url.secret_id
+}

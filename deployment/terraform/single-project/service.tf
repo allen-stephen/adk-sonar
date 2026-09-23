@@ -93,9 +93,41 @@ resource "google_cloud_run_v2_service" "app" {
         name  = "OTEL_INSTRUMENTATION_GENAI_UPLOAD_BASE_PATH"
         value = "gs://${google_storage_bucket.logs_data_bucket.name}/completions"
       }
+
+      env {
+        name = "TASK_DB_URL"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.task_db_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "SESSION_SERVICE_URI"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.task_db_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
     }
 
-    service_account = google_service_account.app_sa.email
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.postgres.connection_name]
+      }
+    }
+
+    service_account                  = google_service_account.app_sa.email
     max_instance_request_concurrency = 8
 
     scaling {

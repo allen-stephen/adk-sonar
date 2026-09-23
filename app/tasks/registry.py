@@ -267,6 +267,15 @@ class TaskRegistry:
             return True
         return False
 
+    async def clear_all(self) -> None:
+        """Cancel all in-flight tasks and clear in-memory task registry state."""
+        async with self._lock:
+            for handle in self._tasks.values():
+                if handle.async_task is not None and not handle.async_task.done():
+                    handle.async_task.cancel()
+            self._tasks.clear()
+            self._next_id = 1
+
     async def wait_next_unconsumed(self, timeout_s: float = 30.0) -> TaskHandle | None:
         """Wait until any unconsumed finished, awaiting_input, or awaiting_approval task is ready."""
         terminal_or_checkpoint = {
