@@ -113,6 +113,19 @@ make dev
 
 Tap the center **Mic button** to start a live voice session, or open **Connected Apps** (plug icon in the top header) to toggle integrations with 1-click OAuth.
 
+### Essential Environment Variables
+
+| Variable | Description | Default / Example |
+|---|---|---|
+| `GOOGLE_CLOUD_PROJECT` | Active Google Cloud project ID hosting Vertex AI | e.g. `agents-cli-test-dev-qi5zi1` |
+| `GOOGLE_CLOUD_LOCATION` | Region for Gemini Live native audio and Vertex Sandbox | `us-central1` |
+| `SANDBOX_GCP_PROJECT` | GCP project ID hosting the Vertex Sandbox container | Inherits `GOOGLE_CLOUD_PROJECT` |
+| `LIVE_VOICE_NAME` | Default Gemini Live persona voice (`Aoede`, `Puck`, `Charon`, `Kore`) | `Aoede` |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub PAT with `repo`, `read:org`, and `workflow` scopes. Auto-populated from `gh auth token` by `make onboard`. | `ghp_...` |
+| `SPOTIFY_CLIENT_ID` | Spotify Developer Dashboard App Client ID. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard). | — |
+| `SPOTIFY_CLIENT_SECRET` | Spotify Developer Dashboard App Client Secret. | — |
+| `SLACK_BOT_TOKEN` | Slack Bot User OAuth Token. Create a Slack app and install it at [api.slack.com/apps](https://api.slack.com/apps). | `xoxb-...` |
+
 ---
 
 ## Build your own with a coding agent
@@ -167,3 +180,4 @@ make sync-secrets
 ## Disclaimer
 
 This repository is for demonstrative and educational purposes only. It is not an officially supported Google product.
+
