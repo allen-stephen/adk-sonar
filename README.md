@@ -41,6 +41,15 @@ An [ADK](https://google.github.io/adk-docs/) reference implementation demonstrat
 - **Two-phase Plan → Execute with human gate** — In `plan` mode, the coding harness analyzes the repo and writes `PLAN.md` without mutating code, rendering a live **Plan Approval Gate** in the UI (`Approve & Execute` / `Request Changes` / `Switch Harness`).
 - **Mid-task harness switching** — Seamlessly hand off an active task (`POST /api/v1/tasks/{id}/switch-harness`) between **ADK Long-Horizon** (`horizon`), **Antigravity CLI** (`antigravity`), and **Claude Code** (`claude`). Because `PLAN.md`, `PROGRESS.md`, and git commits live inside the shared sandbox worktree, the incoming harness picks up right where the previous one left off.
 
+### Supported Coding Harnesses
+
+| Harness ID | Display Name | Protocol / Driver | Default Model | Sandbox Endpoint |
+|---|---|---|---|---|
+| `claude` | Claude Code | Headless CLI (`claude --bare -p`) | `claude-sonnet-4-6` via Vertex | Port 8080 (`/exec`) |
+| `antigravity` | Antigravity CLI | Headless CLI (`agy -p --dangerously-skip-permissions`) | `gemini-2.5-flash` via Vertex | Port 8080 (`/exec`) |
+| `horizon` | ADK Long Horizon | A2A Protocol (`RemoteA2aAgent`) | `gemini-2.5-pro` via Vertex | Port 8081 (`/a2a`) |
+<!-- TODO: Add rows for 'Worktree Isolation Path' and 'Key Environment Overrides' for each harness -->
+
 **Scoped A2UI v0.9 Stage & Mobile Control Plane**
 - **Single-surface visual stage** — Instead of scrolling chat transcripts, the UI (`web/src/components/a2ui/A2UISurfaceDeck.tsx`) renders a focused **A2UI v0.9** surface card (`TaskStatusCard`, `PlanReviewCard`, `GitHubPRCard`, `WorkspaceDigestCard`, `CalendarAgendaCard`, `SpotifyPlayerCard`, `PlaceCard`) synchronized with live voice turns.
 - **Interactive bottom sheets** — Dedicated slide-up drawers for **Tasks** (live terminal diffs, `PLAN.md` inspection, harness switching), **Workspaces** (clone repos, inspect branches, auto-discover personal GitHub forks), **Connected Apps** (1-click OAuth & CLI auth detection), and **Transcript & Text Input**.
