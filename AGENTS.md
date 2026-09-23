@@ -124,6 +124,19 @@ adk-sonar/
 
 ---
 
+## Control Plane REST Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v1/tasks` | `POST` | Dispatch background coding task to sandboxed harness |
+| `/api/v1/tasks/{id}/steer` | `POST` | Steer active task or switch harness mid-flight |
+| `/api/v1/tasks/{id}/approve` | `POST` | Human gate approval to commit and push changes |
+| `/api/v1/harnesses` | `GET` | List available harnesses and active default |
+| `/api/v1/state` | `GET` | Fetch current UI state snapshot for A2UI surface sync |
+| `/api/v1/integrations/workspace` | `POST` | Initiate or refresh workspace OAuth flow for a connected integration |
+
+---
+
 ## Non-Interactive AI Agent Onboarding
 
 If you are an AI coding agent (Claude Code, Gemini CLI, Antigravity) setting up or verifying this repository on behalf of a user, **never run interactive prompts that block on stdin**. Use the `--non-interactive` flags built into `scripts/provision_sandbox.py`:
