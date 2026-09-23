@@ -19,13 +19,6 @@ An [ADK](https://google.github.io/adk-docs/) reference implementation demonstrat
 > - **Build your own** → [Use a coding agent](#build-your-own-with-a-coding-agent) to adapt these patterns to your own domain
 > - **Deploy** → [Deploy](#deploy) ships the FastAPI WebSocket backend + React PWA to Cloud Run
 
-<div align="center">
-
-<!-- TODO: Replace with demo video / GIF once recorded -->
-> 🎬 **Demo Video Coming Soon** — *Live voice orchestration across Google Workspace, GitHub, Spotify, and multi-agent coding sandboxes from mobile.*
-
-</div>
-
 ---
 
 ## Features
@@ -73,6 +66,80 @@ Everything else is custom glue (~2,800 lines across `app/` and `web/`), built on
 6. **Human + AI-Agent dual-mode onboarding** — `scripts/provision_sandbox.py` (`--non-interactive`)
 
 See [`AGENTS.md`](AGENTS.md) for the complete architecture map, start-here file table, and troubleshooting reference.
+
+---
+
+## How it works — Voice-to-sandbox request lifecycle
+
+The diagram below traces a single voice request (*"Write a plan for the auth service refactor"*) from microphone through Gemini Live, across the non-blocking tool boundary, into the Vertex AI Agent Engine sandbox, and back as spoken narration — without ever stalling the audio stream.
+
+```mermaid
+sequenceDiagram
+    actor User as 👤 User (mobile mic)
+    participant WS as WebSocket /run_live
+    participant Gemini as Gemini Live
+    participant NBT as @non_blocking_tool<br/>(NON_BLOCKING / WHEN_IDLE)
+    participant TR as TaskRegistry<br/>(asyncio.Task)
+    participant SW as SandboxWorker
+    participant VAE as Vertex AI<br/>Agent Engine
+    participant HC as CodingHarness<br/>(claude / horizon / agy)
+    participant UI as A2UI Surface Deck
+
+    User->>WS: PCM 16kHz audio frames
+    WS->>Gemini: LiveRequestQueue.send_realtime()
+    Gemini->>NBT: dispatch_task(goal, repo, mode, harness)
+    Note over NBT: NON_BLOCKING — returns in <1 ms
+    NBT-->>Gemini: {status: "RUNNING"}
+    Gemini->>User: 🔊 "Spinning up a Claude plan on auth service now."
+
+    NBT->>TR: TaskRegistry.register() → asyncio.create_task()
+    TR->>SW: SandboxWorker.execute_task()
+    SW->>VAE: _ensure_sandbox() — JWT-signed HTTPS reattach (14-day TTL)
+    SW->>SW: ensure_repo_and_worktree() — git worktree add -B agent/{task_id}
+    SW->>VAE: SandboxProvisioner.ensure_provisioned()
+    VAE-->>SW: harness binary verified / installed
+    SW->>HC: execute_in_sandbox() — POST /exec port 8080
+
+    loop HarnessEvent stream (JSONL stdout)
+        HC-->>TR: HarnessEvent(kind="progress") → TaskHandle.record_event()
+        TR-->>UI: A2UI TaskStatusCard live update
+    end
+
+    alt mode="plan" → awaiting_input
+        HC-->>TR: HarnessEvent(completed) + PLAN.md + questions[]
+        TR-->>Gemini: WHEN_IDLE result fires
+        Gemini->>User: 🔊 "Two clarifying questions: …"
+        User->>Gemini: Voice answer
+        Gemini->>NBT: steer_task(task_id, instruction)
+        NBT->>TR: TaskRegistry.resume() — execute mode
+    else require_approval=True → awaiting_approval
+        HC-->>TR: HarnessEvent(approval_needed) + diff_summary
+        TR-->>UI: A2UI PlanReviewCard (Approve / Request Changes / Switch Harness)
+        TR-->>Gemini: WHEN_IDLE result fires
+        Gemini->>User: 🔊 "One file changed. Approve to commit?"
+        User->>Gemini: "Yes, approve."
+        Gemini->>NBT: approve_task(task_id)
+        NBT->>TR: TaskRegistry.approve() → git add + git commit
+        Gemini->>User: 🔊 "Committed on branch agent/task-1."
+    else execute → completed
+        HC-->>TR: HarnessEvent(kind="completed") + response_text
+        TR-->>Gemini: WHEN_IDLE result fires
+        Gemini->>User: 🔊 "Done — three files changed, all tests passed."
+        TR-->>UI: A2UI TaskStatusCard completed
+    end
+```
+
+**Five stages, one uninterrupted audio stream:**
+
+1. **Voice → `RUNNING` in <1 ms** — PCM audio frames stream over the WebSocket into `Runner.run_live()`. When Gemini detects a coding intent, it calls `dispatch_task()`—wrapped by `non_blocking_tool()`—which declares `NON_BLOCKING` behavior so the Live API immediately returns `{status: "RUNNING"}` while Gemini speaks a brief acknowledgment *without pausing the audio stream* (`app/agent.py` → `non_blocking_tool`).
+
+2. **Background sandbox dispatch** — `TaskRegistry.register()` creates an `asyncio.Task` that calls `SandboxWorker.execute_task()`. The worker sends a JWT-signed HTTPS request to Vertex AI Agent Engine to reattach to (or provision) a persistent sandbox container with a 14-day TTL, then calls `ensure_repo_and_worktree()` to create an isolated `git worktree add -B agent/{task_id}` branch so concurrent tasks never share a working tree (`app/workers/sandbox.py`, `app/workers/harnesses/base.py`).
+
+3. **Harness preflight + execution** — `SandboxProvisioner.ensure_provisioned()` runs a health probe (`claude --version`, `agy --version`) and installs the harness binary if missing (`npm install -g @anthropic-ai/claude-code@latest`). The selected `CodingHarness` then POSTs the CLI invocation to the sandbox `/exec` endpoint on port 8080, streaming JSONL `HarnessEvent` messages back to `TaskHandle.record_event()`, which feeds live diffs to the A2UI `TaskStatusCard` (`app/workers/harnesses/provisioner.py`, `app/workers/harnesses/claude.py`).
+
+4. **Plan gate or approval gate (optional)** — In `plan` mode the harness writes `PLAN.md` and returns `awaiting_input` with clarifying questions; in `execute` mode with `require_approval=True` it returns `awaiting_approval` with a diff summary and surfaces an interactive `PlanReviewCard`. In both cases `watch_tasks()` (an async-generator streaming tool) fires a `WHEN_IDLE` event so Gemini narrates the gate at the *next natural conversational pause* rather than interrupting the current audio segment (`app/tasks.py` → `TaskRegistry.wait_next_unconsumed`).
+
+5. **Voice approval & cross-harness handoff** — The user voices approval (`approve_task()` → `git add && git commit`) or steers the task (`steer_task()` → session resumption). Passing `harness="horizon"` to `steer_task()` triggers a cross-harness handoff: `build_cross_harness_handoff()` serializes the outgoing harness's `PLAN.md`, `files_changed`, and `worktree_path` into a context block that the incoming harness reads before resuming from the same branch (`app/tools/task_tools.py` → `steer_task`, `app/workers/harnesses/prompts.py`).
 
 ---
 
