@@ -132,7 +132,8 @@ adk-sonar/
 | `/api/v1/tasks/{id}/steer` | `POST` | Steer active task or switch harness mid-flight |
 | `/api/v1/tasks/{id}/approve` | `POST` | Human gate approval to commit and push changes |
 | `/api/v1/harnesses` | `GET` | List available harnesses and active default |
-<!-- TODO: Add /api/v1/state and /api/v1/integrations/workspace rows -->
+| `/api/v1/state` | `GET` | Fetch current UI state snapshot for A2UI surface sync |
+| `/api/v1/integrations/workspace` | `POST` | Initiate or refresh workspace OAuth flow for a connected integration |
 
 ---
 
