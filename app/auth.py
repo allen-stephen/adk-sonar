@@ -1153,6 +1153,14 @@ def export_deployment_env() -> str:
         "SLACK_CLIENT_SECRET",
         "SLACK_BOT_TOKEN",
         "SLACK_TEAM_ID",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLOUD_ML_REGION",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     ]
     lines = [
         "# ADK Sonar Voice Orchestrator - Cloud Run / Deployment Credentials",
@@ -1173,19 +1181,33 @@ def get_sandbox_gcp_env() -> dict[str, str]:
 
     Caches resolved `cloud-platform` access tokens for 5 minutes so repeated
     sandbox command executions and polls never block on credential discovery.
+    Reads `.env` directly when not running under pytest so changes to
+    `SANDBOX_GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` take effect without restarting
+    the parent shell of a running `uvicorn --reload` server.
     """
     global _sandbox_gcp_token_cache
 
+    file_env: dict[str, str | None] = {}
+    if not os.getenv("PYTEST_CURRENT_TEST") and DOTENV_PATH.exists():
+        try:
+            from dotenv import dotenv_values
+
+            file_env = dotenv_values(DOTENV_PATH)
+        except Exception:
+            file_env = {}
+
     project_id = (
-        os.getenv("SANDBOX_GCP_PROJECT")
-        or os.getenv("GOOGLE_CLOUD_PROJECT")
-        or ""
-    ).strip()
+        str(file_env.get("SANDBOX_GCP_PROJECT") or "").strip()
+        or str(file_env.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+        or os.getenv("SANDBOX_GCP_PROJECT", "").strip()
+        or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    )
     location = (
-        os.getenv("SANDBOX_GCP_LOCATION")
-        or os.getenv("GOOGLE_CLOUD_LOCATION")
-        or "us-central1"
-    ).strip()
+        str(file_env.get("SANDBOX_GCP_LOCATION") or "").strip()
+        or str(file_env.get("GOOGLE_CLOUD_LOCATION") or "").strip()
+        or os.getenv("SANDBOX_GCP_LOCATION", "").strip()
+        or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1").strip()
+    )
 
     now = time.monotonic()
     token = (os.getenv("SANDBOX_GCP_ACCESS_TOKEN") or "").strip()
@@ -1234,16 +1256,68 @@ def get_sandbox_gcp_env() -> dict[str, str]:
     env: dict[str, str] = {
         "GOOGLE_CLOUD_LOCATION": location,
         "GOOGLE_GENAI_USE_VERTEXAI": os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE"),
+        "CLOUD_ML_REGION": str(
+            file_env.get("CLOUD_ML_REGION") or os.getenv("CLOUD_ML_REGION", "global")
+        ).strip(),
     }
     if project_id:
         env["GOOGLE_CLOUD_PROJECT"] = project_id
+        env["GCLOUD_PROJECT"] = project_id
         env["CLOUDSDK_CORE_PROJECT"] = project_id
         env["GOOGLE_CLOUD_QUOTA_PROJECT"] = project_id
-        env["ANTHROPIC_VERTEX_PROJECT_ID"] = os.getenv(
-            "ANTHROPIC_VERTEX_PROJECT_ID", project_id
+        env["ANTHROPIC_VERTEX_PROJECT_ID"] = (
+            str(file_env.get("ANTHROPIC_VERTEX_PROJECT_ID") or "").strip()
+            or project_id
         )
     if token:
         env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
         env["GOOGLE_OAUTH_ACCESS_TOKEN"] = token
+    gemini_key = (
+        str(file_env.get("GEMINI_API_KEY") or "").strip()
+        or str(file_env.get("GOOGLE_API_KEY") or "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+    )
+    if gemini_key:
+        env["GEMINI_API_KEY"] = gemini_key
+
+    gh_token = (
+        os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+        or os.getenv("GH_TOKEN", "").strip()
+        or str(file_env.get("GITHUB_PERSONAL_ACCESS_TOKEN") or "").strip()
+        or str(file_env.get("GH_TOKEN") or "").strip()
+    )
+    if gh_token:
+        env["GH_TOKEN"] = gh_token
+        env["GITHUB_PERSONAL_ACCESS_TOKEN"] = gh_token
+
+    adc_file = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.getenv("PYTEST_CURRENT_TEST") and os.path.exists(adc_file):
+        env["GOOGLE_APPLICATION_CREDENTIALS"] = (
+            "/workspace/.sonar/application_default_credentials.json"
+        )
     return env
+
+
+def get_local_adc_json_for_sandbox() -> str | None:
+    """Read local `~/.config/gcloud/application_default_credentials.json` and stamp `quota_project_id` with `GOOGLE_CLOUD_PROJECT` for sandbox execution."""
+    import json
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    adc_file = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_file):
+        return None
+    try:
+        with open(adc_file) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        gcp_env = get_sandbox_gcp_env()
+        proj = gcp_env.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        if proj:
+            data["quota_project_id"] = proj
+        return json.dumps(data, separators=(",", ":"))
+    except Exception:
+        return None
 

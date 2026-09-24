@@ -375,4 +375,112 @@ async def test_non_blocking_memory_capture_zero_latency():
     await asyncio.wait_for(call_completed.wait(), timeout=1.0)
 
 
+@pytest.mark.asyncio
+async def test_briefing_cursor_idempotency_and_disconnect_shielding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verify disconnected tasks survive WebSocket close via asyncio.shield and are briefed exactly once."""
+    db_file = tmp_path / "briefing_cursor.db"
+    monkeypatch.setenv("TASK_DB_URL", f"sqlite+aiosqlite:///{db_file}")
+
+    from app.agent import (
+        _hydrate_task_store_callback,
+        build_orchestrator_instruction,
+        dispatch_task,
+        non_blocking_tool,
+    )
+    from app.store.engine import close_db, init_db
+    from app.store.task_store import get_task_store, reset_task_store
+    from app.tasks import get_task_registry, reset_task_registry
+    from app.workers import SandboxWorker, get_harness_registry, reset_harness_registry
+    from tests.fakes import FakeHarness, exec_transport, sandbox_connection
+
+    reset_task_store()
+    reset_task_registry()
+    reset_harness_registry()
+    await init_db()
+
+    gate = asyncio.Event()
+
+    class _SlowHarness(FakeHarness):
+        async def execute_in_sandbox(self, **kwargs):
+            await gate.wait()
+            return await super().execute_in_sandbox(**kwargs)
+
+    get_harness_registry().register_harness(
+        _SlowHarness(
+            name="claude",
+            display_name="Claude Code",
+            summary="Completed background migration while disconnected.",
+        )
+    )
+    monkeypatch.setattr(
+        "app.workers.factory._active_worker",
+        SandboxWorker(
+            connection=sandbox_connection(),
+            http_transport=exec_transport(exit_code=0),
+        ),
+    )
+
+    from google.genai import types
+
+    wrapped = non_blocking_tool(dispatch_task)
+    agen = wrapped.func(
+        goal="Long migration",
+        repo="auth-svc",
+        mode="execute",
+        harness="claude",
+        task_id="task-1",
+    )
+    first_yield = await agen.__anext__()
+    assert isinstance(first_yield, types.FunctionResponse)
+    assert first_yield.scheduling == types.FunctionResponseScheduling.SILENT
+    assert first_yield.response["result"].startswith("Started task-1")
+
+    # Simulate WebSocket disconnect cancelling the ADK streaming tool generator mid-run
+    await agen.aclose()
+
+    reg = get_task_registry()
+    h1 = await reg.get("task-1")
+    assert h1 is not None and h1.async_task is not None
+    assert not h1.async_task.cancelled(), "asyncio.shield must protect background sandbox task on WebSocket close"
+
+    # Let the background task finish while no live session is attached
+    gate.set()
+    await h1.async_task
+
+    # Also seed an orphaned task from a prior server shutdown; it must NOT appear as a failed task in the briefing
+    store = get_task_store()
+    await store.create_task(
+        goal="Old crashed run",
+        repo="legacy-svc",
+        short_id="task-99",
+        status="running",
+    )
+    await store.reconcile_orphaned_tasks()
+    orphaned = await store.get_task("task-99")
+    assert orphaned is not None and orphaned.status == "orphaned"
+
+    # Simulate new process / next session connect (Session B)
+    reset_task_registry()
+
+    class _DummyCtx:
+        pass
+
+    await _hydrate_task_store_callback(_DummyCtx())
+    instruction_b = build_orchestrator_instruction(_DummyCtx())  # type: ignore[arg-type]
+    assert "task-1 on auth-svc: finished while you were away" in instruction_b
+    assert "task-99" not in instruction_b
+
+    # Simulate subsequent session connect (Session C) — CursorRecord was advanced in Session B, so no repeat!
+    await _hydrate_task_store_callback(_DummyCtx())
+    instruction_c = build_orchestrator_instruction(_DummyCtx())  # type: ignore[arg-type]
+    assert "task-1 on auth-svc" not in instruction_c
+
+    await close_db()
+    reset_task_store()
+    reset_task_registry()
+
+
+
 

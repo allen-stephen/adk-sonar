@@ -1,0 +1,77 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "cuj_generalist_menu_and_shopping_list",
+      "persona": "generalist",
+      "repo": "default-repo",
+      "require_agents_cli": false,
+      "steps": [
+        {
+          "mode": "plan",
+          "goal": "Brainstorm a Mediterranean dinner menu for six people."
+        },
+        {
+          "mode": "execute",
+          "goal": "Use the grilled lemon-herb main with dairy-free sides and create a categorized shopping list."
+        }
+      ],
+      "reference": "In step 1 (plan mode), the harness must remain read-only (zero files modified), propose Mediterranean menu options for six people, and ask relevant dietary/preference questions. In step 2 (execute mode), the harness must produce a cohesive 6-person menu with a grilled lemon-herb main and dairy-free sides plus a categorized grocery shopping list (both in the workspace deliverable and summarized clearly for voice handoff)."
+    },
+    {
+      "eval_case_id": "cuj_dev_greenfield_adk_agent",
+      "persona": "developer_greenfield",
+      "repo": "greenfield-agent",
+      "require_agents_cli": true,
+      "steps": [
+        {
+          "mode": "plan",
+          "goal": "Create a new agent to triage release blockers and summarize changelogs."
+        },
+        {
+          "mode": "execute",
+          "goal": "Build the release-triage agent with a tool to categorize blockers by severity."
+        }
+      ],
+      "reference": "In step 1 (plan mode), the harness must stay read-only and outline a plan to scaffold/build an ADK agent using `agents-cli` (`agents-cli create` / `agents-cli scaffold create` or ADK `root_agent` structure). In step 2 (execute mode), the harness must use `agents-cli` / ADK conventions to create a local ADK agent defining `root_agent` with a release-blocker severity tool, with zero cloud deployment side effects."
+    },
+    {
+      "eval_case_id": "cuj_dev_existing_repo_iterative_refinement",
+      "persona": "developer_existing_repo",
+      "repo": "auth-svc",
+      "require_agents_cli": false,
+      "steps": [
+        {
+          "mode": "plan",
+          "goal": "Design a rotating token refresh flow on auth-svc."
+        },
+        {
+          "mode": "plan",
+          "goal": "Revise the plan to keep an in-memory fallback if Redis is unavailable."
+        },
+        {
+          "mode": "execute",
+          "goal": "Implement the rotating token flow with the fallback."
+        }
+      ],
+      "reference": "Across steps 1 and 2 (plan mode), the harness must inspect the seeded `auth-svc` codebase (`src/auth/jwt.py`, `src/cache/redis_store.py`, `tests/test_jwt.py`) without modifying files, and refine the plan to address fallback/error handling. In step 3 (execute mode), the harness must implement the rotating token helper and unit tests in the worktree with passing `pytest`."
+    },
+    {
+      "eval_case_id": "cuj_cross_harness_worktree_handoff",
+      "persona": "developer_multi_harness",
+      "repo": "analytics-svc",
+      "require_agents_cli": false,
+      "steps": [
+        {
+          "mode": "plan",
+          "goal": "Filter out empty or malformed telemetry events in analytics-svc."
+        },
+        {
+          "mode": "execute",
+          "handoff_harness": "antigravity",
+          "goal": "Implement the telemetry event filtering according to the plan."
+        }
+      ],
+      "reference": "In step 1 (plan mode), the primary harness inspects `analytics-svc` (`src/pipeline/batcher.py`, `tests/test_batcher.py`) read-only and proposes a validation plan. In step 2 (execute mode), the handoff harness resumes in the same shared worktree, implements the filtering and unit tests, and `pytest` passes."
+    }
+  ]
+}

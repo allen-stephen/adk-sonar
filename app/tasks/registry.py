@@ -12,6 +12,7 @@ from typing import Any
 
 from app.tasks.handle import TaskHandle, apply_result_to_handle
 from app.tasks.persistence import is_store_active, persist_handle
+from app.workers.base import ApprovalCommitResult
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class TaskRegistry:
         self._tasks: dict[str, TaskHandle] = {}
         self._lock = asyncio.Lock()
         self._next_id = 1
+        self.active_live_queue: Any = None
 
     async def register(
         self,
@@ -34,6 +36,8 @@ class TaskRegistry:
         task_coro_fn: Any,
         harness: str = "claude",
         mode: str = "execute",
+        require_approval: bool = False,
+        task_id: str | None = None,
     ) -> tuple[str, TaskHandle]:
         async with self._lock:
             running_count = sum(
@@ -45,10 +49,16 @@ class TaskRegistry:
                     "Wait for a task to finish or cancel an existing one."
                 )
 
-            while f"task-{self._next_id}" in self._tasks:
-                self._next_id += 1
-            task_id = f"task-{self._next_id}"
-            self._next_id += 1
+            if not task_id:
+                import uuid
+
+                while True:
+                    candidate = f"task-{uuid.uuid4().hex[:8]}"
+                    if candidate not in self._tasks:
+                        task_id = candidate
+                        break
+            elif task_id in self._tasks:
+                raise ValueError(f"Task with ID {task_id} already exists.")
 
             async def _run_wrapper(handle_ref: list[TaskHandle]) -> None:
                 try:
@@ -90,6 +100,7 @@ class TaskRegistry:
                 repo=repo,
                 harness=harness,
                 mode=mode,
+                require_approval=require_approval,
                 branch=f"agent/{task_id}",
                 async_task=async_task,
                 started_at=time.monotonic(),
@@ -123,7 +134,9 @@ class TaskRegistry:
             handle.awaiting_input = False
             handle.awaiting_approval = False
             handle.status = "running"
-            handle.consumed = False
+            handle.from_history = False
+            handle.dismissed = False
+            handle.ended_at_ts = None
             handle.error = None
             handle.exit_code = 0
 
@@ -164,50 +177,68 @@ class TaskRegistry:
         if not handle:
             raise ValueError(f"Task {task_id} was not found.")
 
-        async with self._lock:
-            if handle.worktree_path and Path(handle.worktree_path).exists():
-                subprocess.run(
-                    ["git", "-C", handle.worktree_path, "add", "."],
-                    check=False,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        handle.worktree_path,
-                        "-c",
-                        "user.name=VoiceOrchestrator",
-                        "-c",
-                        "user.email=orchestrator@example.com",
-                        "commit",
-                        "-m",
-                        f"Approved via voice: {handle.goal[:72]}",
-                    ],
-                    check=False,
-                    capture_output=True,
-                )
+        # Delegate to the worker backend: in the sandbox topology the worktree lives
+        # inside the container, so host-side git here would silently no-op while we
+        # still told the user their work was committed.
+        from app.workers import get_worker_backend
 
+        branch_label = handle.branch or f"agent/{handle.task_id}"
+        try:
+            commit_result = await get_worker_backend().commit_and_push_task(
+                task_id=handle.task_id,
+                branch=branch_label,
+                message=f"Approved via voice: {handle.goal[:72]}",
+                worktree_path=handle.worktree_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            logger.warning("approve: commit failed for %s: %s", handle.task_id, exc)
+            commit_result = ApprovalCommitResult(
+                committed=False, pushed=False, detail=f"Commit failed: {exc}"
+            )
+
+        async with self._lock:
             handle.awaiting_approval = False
             handle.status = "completed"
             handle.approved_at = time.time()
-            handle.consumed = False
-            branch_label = handle.branch or f"agent/{handle.task_id}"
-            handle.summary = (
-                f"Approved and committed changes on branch {branch_label} for {handle.repo}."
-            )
+            # Describe only what actually happened. Anything stated here is spoken
+            # to the user and re-injected into the next turn's system prompt.
+            if commit_result.committed and commit_result.pushed:
+                handle.summary = (
+                    f"Approved, committed, and pushed branch {branch_label} for {handle.repo}."
+                )
+            elif commit_result.committed:
+                handle.summary = (
+                    f"Approved and committed branch {branch_label} for {handle.repo}, "
+                    f"but it was not pushed. {commit_result.detail}".strip()
+                )
+            else:
+                handle.summary = (
+                    f"Approved {handle.task_id}, but nothing was committed on branch "
+                    f"{branch_label}. {commit_result.detail}".strip()
+                )
+            handle.approval_detail = commit_result.detail
+            handle.approval_committed = commit_result.committed
+            handle.approval_pushed = commit_result.pushed
             repo_name = handle.repo
 
         await persist_handle(handle, ended=True)
 
-        # Outside the lock: the commit above means the branch now holds the work,
-        # so the checkout can be reclaimed. Kept off the lock (and off the event
-        # loop) because `approve` already blocks on git while holding it, which
-        # stalls the live audio stream.
-        from app.workers.harnesses.base import release_worktree
+        # Outside the lock: once the branch holds the work, the checkout can be
+        # reclaimed. Kept off the lock (and off the event loop) because `approve`
+        # already blocks on git while holding it, which stalls the live audio stream.
+        # Only reclaim on a successful commit: releasing a worktree whose changes
+        # were never committed would destroy the user's work.
+        if commit_result.committed:
+            from app.workers.harnesses.base import release_worktree
 
-        if await asyncio.to_thread(release_worktree, repo_name, task_id):
-            handle.worktree_path = None
+            if await asyncio.to_thread(release_worktree, repo_name, task_id):
+                handle.worktree_path = None
+        else:
+            logger.warning(
+                "approve: keeping worktree for %s because nothing was committed (%s)",
+                task_id,
+                commit_result.detail,
+            )
 
         return handle
 
@@ -241,6 +272,10 @@ class TaskRegistry:
                     for rec in reversed(records):
                         if rec.short_id not in self._tasks:
                             self._tasks[rec.short_id] = rec.to_task_handle()
+                        if rec.short_id.startswith("task-"):
+                            suffix = rec.short_id.removeprefix("task-")
+                            if suffix.isdigit():
+                                self._next_id = max(self._next_id, int(suffix) + 1)
             except Exception as exc:
                 logger.debug("TaskStore hydration on list_all skipped: %s", exc)
 
@@ -259,10 +294,15 @@ class TaskRegistry:
         handle = await self.get(task_id)
         if not handle:
             return False
-        if handle.status == "running":
-            if handle.async_task is not None:
+        if handle.status in {"running", "awaiting_input", "awaiting_approval"}:
+            if handle.async_task is not None and not handle.async_task.done():
                 handle.async_task.cancel()
+            handle.awaiting_input = False
+            handle.awaiting_approval = False
+            handle.questions = []
             handle.status = "cancelled"
+            handle.dismissed = True
+            handle.ended_at_ts = time.time()
             await persist_handle(handle, ended=True)
             return True
         return False
@@ -275,46 +315,6 @@ class TaskRegistry:
                     handle.async_task.cancel()
             self._tasks.clear()
             self._next_id = 1
-
-    async def wait_next_unconsumed(self, timeout_s: float = 30.0) -> TaskHandle | None:
-        """Wait until any unconsumed finished, awaiting_input, or awaiting_approval task is ready."""
-        terminal_or_checkpoint = {
-            "completed",
-            "failed",
-            "cancelled",
-            "awaiting_input",
-            "awaiting_approval",
-        }
-        async with self._lock:
-            for h in self._tasks.values():
-                if h.status in terminal_or_checkpoint and not h.consumed:
-                    h.consumed = True
-                    return h
-
-            active = [
-                h
-                for h in self._tasks.values()
-                if not h.consumed and not h.async_task.done()
-            ]
-
-        if not active:
-            return None
-
-        done, _ = await asyncio.wait(
-            [h.async_task for h in active],
-            timeout=timeout_s,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if not done:
-            return None
-
-        async with self._lock:
-            for h in active:
-                if h.async_task in done and not h.consumed:
-                    h.consumed = True
-                    return h
-        return None
 
 
 _registry: TaskRegistry | None = None

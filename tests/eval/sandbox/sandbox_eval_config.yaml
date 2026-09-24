@@ -1,0 +1,139 @@
+metrics_to_run:
+  - trajectory_completion
+  - phase_contract_compliance
+  - agents_cli_and_verification
+  - voice_handoff_readiness
+  - cuj_goal_achievement
+
+custom_metrics:
+  # 1. Did all steps in the CUJ trajectory complete cleanly (exit_code == 0, no error)?
+  - name: trajectory_completion
+    custom_function: |
+      def evaluate(instance):
+          agent_data = instance.get("agent_data") or {}
+          ctx = {}
+          for turn in (agent_data.get("turns") or []):
+              for ev in (turn.get("events") or []):
+                  for part in ((ev.get("content") or {}).get("parts") or []):
+                      fr = part.get("function_response") if isinstance(part, dict) else None
+                      if isinstance(fr, dict) and isinstance(fr.get("response"), dict):
+                          ctx = fr["response"]
+          steps = ctx.get("steps") or []
+          failed_steps = [
+              f"step {s.get('step_index', 0) + 1} ({s.get('mode')}): exit={s.get('exit_code')} err={s.get('error')}"
+              for s in steps
+              if s.get("exit_code", 1) != 0 or s.get("error")
+          ]
+          ok = bool(steps) and not failed_steps
+          return {
+              "score": 1.0 if ok else 0.0,
+              "explanation": (
+                  f"All {len(steps)} trajectory step(s) completed in {ctx.get('wall_clock_s', 0):.1f}s"
+                  if ok
+                  else f"Failed steps: {'; '.join(failed_steps) or 'no steps recorded'}"
+              ),
+          }
+
+  # 2. Phase discipline:
+  #    - Every mode='plan' step stayed strictly read-only (files_changed == []) and emitted no fabricated strings.
+  #    - Every mode='execute' step produced workspace files/changes or a complete deliverable response.
+  - name: phase_contract_compliance
+    custom_function: |
+      def evaluate(instance):
+          agent_data = instance.get("agent_data") or {}
+          ctx = {}
+          for turn in (agent_data.get("turns") or []):
+              for ev in (turn.get("events") or []):
+                  for part in ((ev.get("content") or {}).get("parts") or []):
+                      fr = part.get("function_response") if isinstance(part, dict) else None
+                      if isinstance(fr, dict) and isinstance(fr.get("response"), dict):
+                          ctx = fr["response"]
+          steps = ctx.get("steps") or []
+          violations = []
+          for s in steps:
+              idx = s.get("step_index", 0) + 1
+              mode = s.get("mode", "execute")
+              summary = (s.get("summary") or "").strip()
+              files = s.get("files_changed") or []
+              if mode == "plan":
+                  if files:
+                      violations.append(f"step {idx} (plan) mutated files: {files}")
+                  if not summary or "Proposed plan from " in summary:
+                      violations.append(f"step {idx} (plan) missing or fabricated summary")
+              else:
+                  ws_files = ctx.get("workspace_files") or []
+                  if not files and not ws_files and not (s.get("response_text") or "").strip():
+                      violations.append(f"step {idx} (execute) produced no deliverable or response")
+          ok = bool(steps) and not violations
+          return {
+              "score": 1.0 if ok else 0.0,
+              "explanation": (
+                  f"Clean phase discipline across {len(steps)} step(s)"
+                  if ok
+                  else "; ".join(violations)
+              ),
+          }
+
+  # 3. Greenfield `agents-cli` usage & worktree pytest verification (when tests exist):
+  #    - For cases with `require_agents_cli: true`, verifies that `agents-cli` was invoked
+  #      and/or a valid ADK agent (`root_agent` / `google.adk`) was created in the workspace.
+  #    - When pytest tests exist in the worktree (pytest_exit_code != 5), verifies pytest passed (exit_code == 0).
+  - name: agents_cli_and_verification
+    custom_function: |
+      def evaluate(instance):
+          agent_data = instance.get("agent_data") or {}
+          ctx = {}
+          for turn in (agent_data.get("turns") or []):
+              for ev in (turn.get("events") or []):
+                  for part in ((ev.get("content") or {}).get("parts") or []):
+                      fr = part.get("function_response") if isinstance(part, dict) else None
+                      if isinstance(fr, dict) and isinstance(fr.get("response"), dict):
+                          ctx = fr["response"]
+          issues = []
+          if ctx.get("require_agents_cli"):
+              if not (ctx.get("used_agents_cli") or ctx.get("adk_agent_detected")):
+                  issues.append(
+                      "Expected harness to use agents-cli / scaffold an ADK agent (root_agent), but neither was detected"
+                  )
+          pytest_ec = ctx.get("pytest_exit_code", 5)
+          # Exit code 5 in pytest means "no tests collected" (expected for menu/shopping list or pure plan steps)
+          if pytest_ec not in (0, 5):
+              issues.append(f"Worktree pytest failed (exit_code={pytest_ec}): {(ctx.get('pytest_stdout') or '')[:180]}")
+          ok = not issues
+          return {
+              "score": 1.0 if ok else 0.0,
+              "explanation": (
+                  f"Verified (used_agents_cli={ctx.get('used_agents_cli')}, adk_agent={ctx.get('adk_agent_detected')}, pytest_ec={pytest_ec})"
+                  if ok
+                  else "; ".join(issues)
+              ),
+          }
+
+  # 4. Voice handoff readiness: verifies that the summary returned to the voice orchestrator
+  #    is a real prose synthesis (never 'Running Bash' or empty) so the voice agent can narrate it accurately.
+  - name: voice_handoff_readiness
+    custom_function: |
+      def evaluate(instance):
+          agent_data = instance.get("agent_data") or {}
+          ctx = {}
+          for turn in (agent_data.get("turns") or []):
+              for ev in (turn.get("events") or []):
+                  for part in ((ev.get("content") or {}).get("parts") or []):
+                      fr = part.get("function_response") if isinstance(part, dict) else None
+                      if isinstance(fr, dict) and isinstance(fr.get("response"), dict):
+                          ctx = fr["response"]
+          summary = (ctx.get("summary") or "").strip()
+          bad_summaries = {"Running Bash", "Running Read", "Running Edit", "Running Write", ""}
+          ok = summary not in bad_summaries and not summary.startswith("Running ") and len(summary) >= 15
+          return {
+              "score": 1.0 if ok else 0.0,
+              "explanation": (
+                  f"Clean voice handoff summary ({len(summary)} chars): {summary[:120]}"
+                  if ok
+                  else f"Unusable summary for voice narration: {summary!r}"
+              ),
+          }
+
+  # 5. LLM-as-judge grading end-to-end CUJ goal achievement against the case reference
+  - name: cuj_goal_achievement
+    custom_function_file: diff_judge.py

@@ -359,12 +359,32 @@ async def _collect_sandbox_worktree_changes(
     cmd = (
         f"cd {shlex.quote(worktree_path)} 2>/dev/null && "
         "git add -A -N >/dev/null 2>&1 && "
-        "git status --porcelain 2>/dev/null && echo '---NUMSTAT---' && "
-        "git diff --numstat HEAD 2>/dev/null && echo '---DIFF---' && "
-        "git diff HEAD 2>/dev/null"
+        "STATUS=$(git status --porcelain 2>/dev/null); "
+        'if [ -n "$STATUS" ]; then '
+        '  printf "%s\\n" "$STATUS"; '
+        "  echo '---NUMSTAT---'; git diff --numstat HEAD 2>/dev/null; "
+        "  echo '---DIFF---'; git diff HEAD 2>/dev/null; "
+        "else "
+        "  BASE=$(git merge-base HEAD main 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo ''); "
+        '  if [ -n "$BASE" ] && [ "$BASE" != "$(git rev-parse HEAD 2>/dev/null)" ]; then '
+        '    git diff --name-only "$BASE" HEAD 2>/dev/null | sed "s/^/M  /"; '
+        '    echo "---NUMSTAT---"; git diff --numstat "$BASE" HEAD 2>/dev/null; '
+        '    echo "---DIFF---"; git diff "$BASE" HEAD 2>/dev/null; '
+        "  fi; "
+        "fi"
     )
     res = await exec_in_sandbox(context, cmd, timeout_s=30.0)
-    if res.exit_code != 0 or not res.stdout:
+    if res.exit_code != 0:
+        # A broken git invocation must not masquerade as "no changes made", or a
+        # harness that silently did nothing scores the same as one that worked.
+        detail = (res.error or res.stderr or "").strip()[:200]
+        return (
+            [],
+            f"Could not inspect changes in {worktree_path}: git exited "
+            f"{res.exit_code}. {detail}".strip(),
+            "",
+        )
+    if not res.stdout:
         return ([], "", "")
 
     parts = res.stdout.split("---DIFF---", 1)
@@ -411,6 +431,81 @@ async def collect_worktree_changes(
     if context is not None and str(worktree_path).startswith("/workspace"):
         return await _collect_sandbox_worktree_changes(context, str(worktree_path))
     return await asyncio.to_thread(_collect_worktree_changes_sync, worktree_path)
+
+
+_ARTIFACT_DOC_EXTENSIONS = {".md", ".txt", ".csv", ".html"}
+_IGNORED_ARTIFACT_NAMES = {
+    "agents.md",
+    "claude.md",
+    "gemini.md",
+    "readme.md",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+}
+
+
+def _humanize_artifact_title(rel_path: str, content: str) -> str:
+    """Derive a clean human-readable title from markdown heading or filename."""
+    for line in content.splitlines()[:6]:
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            heading = stripped[2:].strip().strip("*_`")
+            if heading:
+                return heading[:64]
+    stem = Path(rel_path).stem.replace("_", " ").replace("-", " ").strip()
+    return stem.title() if stem else Path(rel_path).name
+
+
+async def collect_worktree_artifacts(
+    worktree_path: str | Path,
+    files_changed: list[str],
+    context: SandboxContext | None = None,
+) -> list[dict[str, str]]:
+    """Extract content of readable document deliverables (.md, .txt, .csv, .html) created/modified in the worktree."""
+    candidates = [
+        f
+        for f in (files_changed or [])
+        if Path(f).suffix.lower() in _ARTIFACT_DOC_EXTENSIONS
+        and Path(f).name.lower() not in _IGNORED_ARTIFACT_NAMES
+    ][:4]
+    if not candidates:
+        return []
+
+    artifacts: list[dict[str, str]] = []
+    if context is not None and str(worktree_path).startswith("/workspace"):
+        wt_str = str(worktree_path)
+        for rel in candidates:
+            cmd = f"head -c 14000 {shlex.quote(wt_str + '/' + rel)} 2>/dev/null || true"
+            res = await exec_in_sandbox(context, cmd, timeout_s=15.0)
+            text = (res.stdout or "").strip()
+            if text:
+                artifacts.append(
+                    {
+                        "name": rel,
+                        "title": _humanize_artifact_title(rel, text),
+                        "content": text,
+                    }
+                )
+        return artifacts
+
+    wt = Path(worktree_path)
+    for rel in candidates:
+        target = wt / rel
+        if target.is_file():
+            try:
+                text = target.read_text(encoding="utf-8", errors="replace")[:14000].strip()
+                if text:
+                    artifacts.append(
+                        {
+                            "name": rel,
+                            "title": _humanize_artifact_title(rel, text),
+                            "content": text,
+                        }
+                    )
+            except Exception:
+                continue
+    return artifacts
 
 
 

@@ -17,15 +17,18 @@ class TaskHandle:
     async_task: asyncio.Task | None = None
     harness: str = "claude"
     mode: str = "execute"
+    require_approval: bool = False
     branch: str | None = None
     worktree_path: str | None = None
-    consumed: bool = False
+    awaited_by_live_tool: bool = False
+    last_event_id: int | None = None
     exit_code: int | None = None
     summary: str | None = None
     error: str | None = None
     response_text: str | None = None
     claude_session_id: str | None = None
     files_changed: list[str] = field(default_factory=list)
+    artifacts: list[dict[str, str]] = field(default_factory=list)
     questions: list[str] = field(default_factory=list)
     awaiting_input: bool = False
     awaiting_approval: bool = False
@@ -33,8 +36,15 @@ class TaskHandle:
     raw_diff: str | None = None
     pending_action: str | None = None
     approved_at: float | None = None
+    # What the approval commit actually did, so the spoken confirmation can match
+    # reality rather than asserting a commit and push unconditionally.
+    approval_committed: bool = False
+    approval_pushed: bool = False
+    approval_detail: str | None = None
     created_at_ts: float = field(default_factory=time.time)
     ended_at_ts: float | None = None
+    from_history: bool = False
+    dismissed: bool = False
     latest_update: str | None = None
     events: list[str] = field(default_factory=list)
     _status: str | None = None
@@ -86,6 +96,7 @@ def apply_result_to_handle(handle: TaskHandle, result: Any) -> None:
             or handle.claude_session_id
         )
         handle.files_changed = list(getattr(result, "files_changed", []) or [])
+        handle.artifacts = list(getattr(result, "artifacts", []) or [])
         handle.questions = list(getattr(result, "questions", []) or [])
         handle.awaiting_input = bool(
             getattr(result, "awaiting_input", False) or handle.questions

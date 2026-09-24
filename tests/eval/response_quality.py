@@ -45,7 +45,10 @@ def evaluate(instance):
         "Google Search for that' or 'Starting the Claude Code planning phase now') while the "
         "background tool executes asynchronously (`status: The function is running asynchronously "
         "and the results are pending`). Award a full 5/5 when the agent invokes the correct tool "
-        "with appropriate arguments and speaks a clear, natural acknowledgment or grounded answer."
+        "with appropriate arguments and speaks a clear, natural acknowledgment or grounded answer. "
+        "For casual greetings (e.g. 'Hi there'), award 5/5 for a warm, brief, natural peer greeting "
+        "(and optional heads-up on any active background task), and penalize robotic customer-service "
+        "clichés like 'How can I help you with your workspace or coding tasks today?'."
     )
     if reference:
         rubric += (

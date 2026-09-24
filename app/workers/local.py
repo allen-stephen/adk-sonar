@@ -6,10 +6,11 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-from app.workers.base import WorkerBackend, WorkerExecutionResult
+from app.workers.base import ApprovalCommitResult, WorkerBackend, WorkerExecutionResult
 from app.workers.harnesses import (
     CodingHarness,
     HarnessEvent,
@@ -200,3 +201,75 @@ class LocalWorker(WorkerBackend):
                 proc.kill()
             return True
         return False
+
+    async def commit_and_push_task(
+        self,
+        *,
+        task_id: str,
+        branch: str,
+        message: str,
+        worktree_path: str | None = None,
+    ) -> ApprovalCommitResult:
+        """Commit an approved task worktree on the host, pushing only if a remote exists."""
+
+        def _run() -> ApprovalCommitResult:
+            if not worktree_path:
+                return ApprovalCommitResult(
+                    committed=False, pushed=False, detail="No worktree recorded for this task."
+                )
+            wt = Path(worktree_path)
+            if not wt.exists():
+                return ApprovalCommitResult(
+                    committed=False, pushed=False, detail=f"Worktree {wt} not found on host."
+                )
+
+            subprocess.run(
+                ["git", "-C", str(wt), "add", "-A"], check=False, capture_output=True
+            )
+            staged = subprocess.run(
+                ["git", "-C", str(wt), "diff", "--cached", "--quiet"],
+                check=False,
+                capture_output=True,
+            )
+            if staged.returncode == 0:
+                committed, detail = False, "No uncommitted changes to commit."
+            else:
+                commit = subprocess.run(
+                    [
+                        "git", "-C", str(wt),
+                        "-c", "user.name=VoiceOrchestrator",
+                        "-c", "user.email=orchestrator@example.com",
+                        "commit", "-m", message,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                committed = commit.returncode == 0
+                detail = (
+                    "Committed locally."
+                    if committed
+                    else f"Commit failed: {(commit.stderr or '').strip()[:200]}"
+                )
+
+            has_remote = subprocess.run(
+                ["git", "-C", str(wt), "remote"], check=False, capture_output=True, text=True
+            )
+            if not (has_remote.returncode == 0 and has_remote.stdout.strip()):
+                return ApprovalCommitResult(
+                    committed=committed,
+                    pushed=False,
+                    detail=f"{detail} No git remote configured, so nothing was pushed.",
+                )
+            push = subprocess.run(
+                ["git", "-C", str(wt), "push", "-u", "origin", branch],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            pushed = push.returncode == 0
+            if not pushed:
+                detail = f"{detail} Push failed: {(push.stderr or '').strip()[:200]}"
+            return ApprovalCommitResult(committed=committed, pushed=pushed, detail=detail)
+
+        return await asyncio.to_thread(_run)

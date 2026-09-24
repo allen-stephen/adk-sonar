@@ -42,7 +42,7 @@ async def test_task_registry_lifecycle():
         repo="my-repo",
         task_coro_fn=coro,
     )
-    assert task_id == "task-1"
+    assert task_id.startswith("task-")
     assert handle.goal == "Refactor auth"
 
     await handle.async_task
@@ -51,13 +51,12 @@ async def test_task_registry_lifecycle():
     assert handle.files_changed == ["primes.py"]
     assert handle.claude_session_id == "sess-123"
 
-    finished = await registry.wait_next_unconsumed(timeout_s=1.0)
-    assert finished is not None
-    assert finished.task_id == "task-1"
-    assert finished.consumed is True
+    from app.tools.task_tools import format_task_completion_for_voice
 
-    again = await registry.wait_next_unconsumed(timeout_s=0.1)
-    assert again is None
+    completion_msg = format_task_completion_for_voice(handle)
+    assert "my-repo" in completion_msg
+    assert "completed" in completion_msg
+    assert "primes.py" in completion_msg
 
 
 @pytest.mark.asyncio
@@ -102,17 +101,17 @@ async def test_plan_and_steer_lifecycle(tmp_path: Path, monkeypatch: pytest.Monk
         mode="plan",
         harness="fake",
     )
-    assert "task-1" in dispatch_msg
+    reg = get_task_registry()
+    handle = list(reg._tasks.values())[0]
+    tid = handle.task_id
+    assert tid in dispatch_msg
     assert "plan mode" in dispatch_msg
 
-    reg = get_task_registry()
-    handle = await reg.get("task-1")
-    assert handle is not None
     await handle.async_task
     assert handle.status == "awaiting_input"
     assert len(handle.questions) > 0
 
-    result_msg = await get_task_result("task-1")
+    result_msg = await get_task_result(tid)
     assert "awaiting_input" in result_msg
     assert "Questions for you:" in result_msg
     assert "Should the generator be iterative or use a sieve?" in result_msg
@@ -122,11 +121,11 @@ async def test_plan_and_steer_lifecycle(tmp_path: Path, monkeypatch: pytest.Monk
 
     # 2. Steer task to execute mode
     steer_msg = await steer_task(
-        task_id="task-1",
+        task_id=tid,
         instruction="Use a library function and include pytest benchmarks.",
         mode="execute",
     )
-    assert "Resumed task-1 in execute mode" in steer_msg
+    assert f"Resumed {tid} in execute mode" in steer_msg
     await handle.async_task
     assert handle.status == "completed"
     assert len(handle.files_changed) == 1

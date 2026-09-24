@@ -35,6 +35,7 @@ interface A2UISurfaceDeckProps {
   isStackCollapsed: boolean;
   activeHarnessName: string;
   onApprovePlan: (taskId: string, selectedOption: string) => void;
+  onCancelTask?: (taskId: string) => void;
   onDismissSurface: (surfaceId: string) => void;
   onSelectStarterPrompt: (prompt: string) => void;
 }
@@ -711,11 +712,605 @@ function ContextSurfaceBody({ surface }: { surface: A2UISurface }) {
   );
 }
 
+const SUBTITLE_CLAMP_STYLE: React.CSSProperties = {
+  display: "-webkit-box",
+  WebkitLineClamp: 3,
+  WebkitBoxOrient: "vertical",
+  overflow: "hidden",
+};
+
+function cleanDisplayText(raw?: string | null): string {
+  if (!raw) return "";
+  return raw
+    .replace(/📎?\s*\[([^\]]+)\]\((?:file:\/\/|\/lha\/workspace\/download)[^\)]*\)/g, "$1")
+    .replace(/\(?(?:file:\/\/|\/lha\/workspace\/download)[^\s\)]+\)?/g, "")
+    .replace(/projects\/\d+\/locations\/\S+/g, "Vertex Sandbox")
+    .replace(/\(X-Sandbox-Port:[^\)]*\)/g, "")
+    .replace(/You can verify the (?:updated |created )?files here:.*?(?=(?:Let me know|$))/is, "")
+    .replace(/\*\*/g, "")
+    .replace(/`/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+interface ArtifactItem {
+  name: string;
+  title: string;
+  content: string;
+}
+
+function ArtifactDetailReader({
+  art,
+  onBack,
+  savedDocUrls,
+  setSavedDocUrls,
+}: {
+  art: ArtifactItem;
+  onBack: () => void;
+  savedDocUrls: Record<string, string>;
+  setSavedDocUrls: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [savingDoc, setSavingDoc] = useState(false);
+  const docUrl = savedDocUrls[art.name];
+  const lines = (art.content || "").split(/\r?\n/);
+
+  const handleSaveGoogleDoc = async () => {
+    if (savingDoc || docUrl) return;
+    setSavingDoc(true);
+    try {
+      const res = await fetch("/api/v1/artifacts/google-doc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: art.title || art.name, content: art.content }),
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+        setSavedDocUrls((prev) => ({ ...prev, [art.name]: data.url }));
+        window.open(data.url, "_blank", "noopener,noreferrer");
+      }
+    } catch {
+      // ignore network error
+    } finally {
+      setSavingDoc(false);
+    }
+  };
+
+  const handleCopy = () => {
+    void navigator.clipboard?.writeText(art.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <button
+          type="button"
+          onClick={onBack}
+          style={{
+            background: "rgba(255, 255, 255, 0.06)",
+            border: "1px solid rgba(255, 255, 255, 0.1)",
+            borderRadius: 99,
+            padding: "4px 10px",
+            color: "#93c5fd",
+            fontSize: 11.5,
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          ← Back
+        </button>
+        <span
+          style={{
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: "#f8fafc",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {art.title}
+        </span>
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+          padding: "12px 14px",
+          borderRadius: 14,
+          background: "rgba(10, 13, 20, 0.72)",
+          border: "1px solid rgba(255, 255, 255, 0.08)",
+          maxHeight: 230,
+          overflowY: "auto",
+          fontSize: 12.5,
+          lineHeight: 1.45,
+          color: "#e2e8f0",
+        }}
+      >
+        {lines.map((rawLine: string, idx: number) => {
+          const trimmed = rawLine.trim();
+          if (!trimmed) return <div key={idx} style={{ height: 4 }} />;
+          if (trimmed.startsWith("#")) {
+            const headingText = trimmed.replace(/^#+\s*/, "").replace(/\*\*/g, "");
+            return (
+              <div
+                key={idx}
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#f8fafc",
+                  marginTop: idx > 0 ? 6 : 0,
+                }}
+              >
+                {headingText}
+              </div>
+            );
+          }
+          const isBullet = /^[-*•]\s+/.test(trimmed) || /^\d+[.)]\s+/.test(trimmed);
+          const cleanLine = trimmed
+            .replace(/^[-*•]\s+/, "")
+            .replace(/^\[[ xX]\]\s+/, "")
+            .replace(/\*\*/g, "");
+          return (
+            <div
+              key={idx}
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 7,
+                color: isBullet ? "#cbd5e1" : "#e2e8f0",
+              }}
+            >
+              {isBullet && (
+                <span style={{ color: "#60a5fa", fontWeight: 700 }}>•</span>
+              )}
+              <span>{cleanLine}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        {docUrl ? (
+          <a
+            href={docUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="a2ui-primary-btn"
+            style={{
+              flex: 1,
+              textDecoration: "none",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 6,
+            }}
+          >
+            <span>Open in Google Docs</span>
+            <ExternalLink size={13} />
+          </a>
+        ) : (
+          <button
+            type="button"
+            className="a2ui-primary-btn"
+            style={{ flex: 1 }}
+            onClick={() => void handleSaveGoogleDoc()}
+          >
+            {savingDoc ? "Saving to Drive..." : "Save to Google Docs"}
+          </button>
+        )}
+        <button
+          type="button"
+          className="a2ui-option-pill"
+          style={{ width: "auto", padding: "0 14px", fontWeight: 600 }}
+          onClick={handleCopy}
+        >
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ArtifactRowList({
+  artifacts,
+  onSelectArtifact,
+}: {
+  artifacts: ArtifactItem[];
+  onSelectArtifact: (idx: number) => void;
+}) {
+  if (artifacts.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {artifacts.map((art, idx) => (
+        <button
+          key={art.name}
+          type="button"
+          onClick={() => onSelectArtifact(idx)}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            width: "100%",
+            padding: "10px 13px",
+            borderRadius: 13,
+            background: "rgba(255, 255, 255, 0.04)",
+            border: "1px solid rgba(255, 255, 255, 0.09)",
+            color: "#f8fafc",
+            cursor: "pointer",
+            textAlign: "left",
+          }}
+        >
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+            <FileText size={15} color="#60a5fa" style={{ flexShrink: 0 }} />
+            <span
+              style={{
+                fontSize: 13,
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {art.title}
+            </span>
+          </span>
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11,
+              fontWeight: 600,
+              color: "#93c5fd",
+              flexShrink: 0,
+            }}
+          >
+            <span>Read</span>
+            <ChevronRight size={13} />
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PlanApprovalBody({
+  surface,
+  planSteps,
+  hasQuestions,
+  options,
+  currentChoice,
+  onSelectChoice,
+  onApprovePlan,
+  onCancelTask,
+  onDismissSurface,
+}: {
+  surface: A2UISurface;
+  planSteps: string[];
+  hasQuestions: boolean;
+  options: string[];
+  currentChoice: string;
+  onSelectChoice: (choice: string) => void;
+  onApprovePlan: (taskId: string, selectedOption: string) => void;
+  onCancelTask?: (taskId: string) => void;
+  onDismissSurface: (surfaceId: string) => void;
+}) {
+  const [activeArtifactIdx, setActiveArtifactIdx] = useState<number | null>(null);
+  const [savedDocUrls, setSavedDocUrls] = useState<Record<string, string>>({});
+
+  const planArtifacts: ArtifactItem[] =
+    Array.isArray(surface.dataModel?.plan?.artifacts)
+      ? surface.dataModel.plan.artifacts
+      : [];
+
+  if (activeArtifactIdx !== null && planArtifacts[activeArtifactIdx]) {
+    return (
+      <ArtifactDetailReader
+        art={planArtifacts[activeArtifactIdx]}
+        onBack={() => setActiveArtifactIdx(null)}
+        savedDocUrls={savedDocUrls}
+        setSavedDocUrls={setSavedDocUrls}
+      />
+    );
+  }
+
+  const cleanSub = cleanDisplayText(surface.subtitle);
+
+  return (
+    <>
+      <p
+        className="a2ui-subtitle"
+        style={{ color: "#e2e8f0", fontWeight: 500, ...SUBTITLE_CLAMP_STYLE }}
+      >
+        {cleanSub}
+      </p>
+
+      {/* If the harness generated deliverable artifacts (e.g. a recipe, grocery list, or full plan doc), render tappable Artifact rows */}
+      {planArtifacts.length > 0 && (
+        <ArtifactRowList
+          artifacts={planArtifacts}
+          onSelectArtifact={(idx) => setActiveArtifactIdx(idx)}
+        />
+      )}
+
+      {/* Show concise plan steps when no artifacts are attached or when reviewing a code diff */}
+      {planSteps.length > 0 && (planArtifacts.length === 0 || surface.dataModel?.plan?.diffSummary) && (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            padding: "10px 12px",
+            borderRadius: 13,
+            background: "rgba(12, 15, 22, 0.48)",
+            border: "1px solid rgba(255, 255, 255, 0.06)",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 10.5,
+              fontWeight: 600,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+              color: "var(--text-muted)",
+              marginBottom: 2,
+            }}
+          >
+            {surface.dataModel?.plan?.diffSummary
+              ? "Sandbox Diff Summary"
+              : "Key Steps"}
+          </div>
+          {planSteps.slice(0, 3).map((step, i) => (
+            <div
+              key={i}
+              style={{
+                fontSize: 12,
+                color: "var(--text-secondary)",
+                display: "flex",
+                gap: 7,
+                lineHeight: 1.4,
+                minWidth: 0,
+              }}
+            >
+              {planSteps.length > 1 && (
+                <span style={{ color: "#60a5fa", fontWeight: 600, flexShrink: 0 }}>
+                  {i + 1}.
+                </span>
+              )}
+              <span
+                style={{
+                  overflowWrap: "anywhere",
+                  wordBreak: "break-word",
+                  minWidth: 0,
+                }}
+              >
+                {step}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {hasQuestions && (
+        <div className="a2ui-options-list">
+          {options.map((optionText) => {
+            const isSelected = currentChoice === optionText;
+            return (
+              <button
+                key={optionText}
+                type="button"
+                className={`a2ui-option-pill ${isSelected ? "selected" : ""}`}
+                onClick={() => onSelectChoice(optionText)}
+              >
+                <span>{optionText}</span>
+                {isSelected && <Check size={15} color="#93c5fd" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button
+          type="button"
+          id="approve-execute-plan-btn"
+          className="a2ui-primary-btn"
+          style={{ flex: 1 }}
+          onClick={() =>
+            onApprovePlan(surface.taskId || "task-1", currentChoice)
+          }
+        >
+          {surface.dataModel?.plan?.diffSummary
+            ? "Approve & Commit"
+            : "Approve & Execute"}
+        </button>
+        <button
+          type="button"
+          className="a2ui-option-pill"
+          style={{
+            width: "auto",
+            padding: "0 15px",
+            fontWeight: 600,
+            color: "var(--text-secondary)",
+          }}
+          onClick={() => {
+            if (surface.taskId && onCancelTask) {
+              onCancelTask(surface.taskId);
+            } else {
+              onDismissSurface(surface.surfaceId);
+            }
+          }}
+        >
+          {planArtifacts.length > 0 ? "Done" : "Cancel"}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function TaskOutcomeBody({
+  surface,
+  isOutcomeFailed,
+  outcomeError,
+  outcomeVerification,
+  outcomeFiles,
+  onDismissSurface,
+}: {
+  surface: A2UISurface;
+  isOutcomeFailed: boolean;
+  outcomeError: string | null;
+  outcomeVerification: string;
+  outcomeFiles: string[];
+  onDismissSurface: (surfaceId: string) => void;
+}) {
+  const [activeArtifactIdx, setActiveArtifactIdx] = useState<number | null>(null);
+  const [showCodeFiles, setShowCodeFiles] = useState(false);
+  const [savedDocUrls, setSavedDocUrls] = useState<Record<string, string>>({});
+
+  const rawArtifacts: ArtifactItem[] =
+    Array.isArray(surface.dataModel?.outcome?.artifacts)
+      ? surface.dataModel.outcome.artifacts
+      : [];
+
+  // Fallback: if outcomeFiles has .md/.txt files and backend artifacts weren't populated yet
+  const docFiles = outcomeFiles.filter((f) => /\.(md|txt|csv|html)$/i.test(f));
+  const hasDeliverableDocs = rawArtifacts.length > 0 || docFiles.length > 0;
+  const codeFiles = outcomeFiles.filter((f) => !/\.(md|txt|csv|html)$/i.test(f));
+
+  const cleanSub = cleanDisplayText(surface.subtitle);
+
+  if (activeArtifactIdx !== null && rawArtifacts[activeArtifactIdx]) {
+    return (
+      <ArtifactDetailReader
+        art={rawArtifacts[activeArtifactIdx]}
+        onBack={() => setActiveArtifactIdx(null)}
+        savedDocUrls={savedDocUrls}
+        setSavedDocUrls={setSavedDocUrls}
+      />
+    );
+  }
+
+  return (
+    <>
+      <p
+        className="a2ui-subtitle"
+        style={{ color: "#f1f5f9", lineHeight: 1.45, ...SUBTITLE_CLAMP_STYLE }}
+      >
+        {cleanSub}
+      </p>
+
+      {/* Failed Task Callout */}
+      {isOutcomeFailed && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+            padding: "9px 12px",
+            borderRadius: 12,
+            background: "rgba(248, 113, 113, 0.12)",
+            border: "1px solid rgba(248, 113, 113, 0.32)",
+            color: "#fca5a5",
+            fontSize: 12,
+            fontWeight: 600,
+            lineHeight: 1.4,
+          }}
+        >
+          <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>{(outcomeError || cleanSub || "Task failed").slice(0, 180)}</span>
+        </div>
+      )}
+
+      {/* Mode A: Deliverable Artifacts (Recipes, Grocery Lists, Research Docs, Briefs) */}
+      {!isOutcomeFailed && rawArtifacts.length > 0 && (
+        <ArtifactRowList
+          artifacts={rawArtifacts}
+          onSelectArtifact={(idx) => setActiveArtifactIdx(idx)}
+        />
+      )}
+
+      {/* Mode B: Executive Engineering Receipt (when code files were updated, collapsed by default) */}
+      {!isOutcomeFailed && !hasDeliverableDocs && codeFiles.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <button
+            type="button"
+            onClick={() => setShowCodeFiles((prev) => !prev)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+              width: "100%",
+              padding: "9px 12px",
+              borderRadius: 12,
+              background: "rgba(16, 185, 129, 0.1)",
+              border: "1px solid rgba(16, 185, 129, 0.25)",
+              color: "#6ee7b7",
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+              <CheckCircle2 size={14} />
+              <span>{outcomeVerification}</span>
+            </span>
+            <span style={{ fontSize: 11, color: "#93c5fd" }}>
+              {showCodeFiles ? "Hide files" : `${codeFiles.length} files`}
+            </span>
+          </button>
+
+          {showCodeFiles && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {codeFiles.map((file) => (
+                <span
+                  key={file}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    padding: "3px 8px",
+                    borderRadius: 7,
+                    background: "rgba(255, 255, 255, 0.04)",
+                    border: "1px solid rgba(255, 255, 255, 0.07)",
+                    fontSize: 10.5,
+                    fontFamily: "var(--font-mono)",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  <FileCode2 size={11} color="#93c5fd" />
+                  {file}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <button
+        type="button"
+        className="a2ui-option-pill"
+        style={{ justifyContent: "center", fontWeight: 600 }}
+        onClick={() => onDismissSurface(surface.surfaceId)}
+      >
+        {isOutcomeFailed ? "Dismiss" : "Done"}
+      </button>
+    </>
+  );
+}
+
 export function A2UISurfaceDeck({
   surfaces,
   isSessionActive,
   isStackCollapsed,
   onApprovePlan,
+  onCancelTask,
   onDismissSurface,
   onSelectStarterPrompt,
 }: A2UISurfaceDeckProps) {
@@ -862,26 +1457,36 @@ export function A2UISurfaceDeck({
     .map((s, idx) => ({ surface: s, idx }))
     .filter((item) => item.idx !== safeIdx);
 
-  const options: string[] =
-    activeSurface.dataModel?.plan?.options || [
-      "Rotate JWT via Redis TTL (Recommended)",
-      "Stateless JWKS endpoint with 15m grace window",
-    ];
+  const options: string[] = Array.isArray(activeSurface.dataModel?.plan?.options)
+    ? activeSurface.dataModel.plan.options
+    : [];
+  const hasQuestions: boolean = Boolean(
+    activeSurface.dataModel?.plan?.hasQuestions && options.length > 0
+  );
   const planSteps: string[] = activeSurface.dataModel?.plan?.steps || [];
   const currentChoice =
     selectedOptions[activeSurface.surfaceId] ||
     activeSurface.dataModel?.plan?.selectedOption ||
-    options[0];
+    options[0] ||
+    "Proceed with execution";
   const milestones: TaskMilestone[] =
     activeSurface.dataModel?.trajectory?.milestones ||
     activeSurface.dataModel?.outcome?.milestones ||
     [];
+  const trajectoryElapsed: number =
+    activeSurface.dataModel?.trajectory?.elapsedSeconds || 0;
   const outcomeFiles: string[] =
     activeSurface.dataModel?.outcome?.files || [];
   const outcomeStatus: string =
     activeSurface.dataModel?.outcome?.status || "completed";
   const outcomeError: string | null =
     activeSurface.dataModel?.outcome?.error || null;
+  const outcomeVerification: string =
+    activeSurface.dataModel?.outcome?.diffSummary ||
+    activeSurface.dataModel?.outcome?.verification ||
+    (outcomeFiles.length > 0
+      ? `${outcomeFiles.length} file(s) updated in sandbox worktree`
+      : "Completed in Vertex Sandbox");
   const isOutcomeFailed =
     outcomeStatus === "failed" ||
     outcomeStatus === "cancelled" ||
@@ -903,18 +1508,20 @@ export function A2UISurfaceDeck({
             )}
             <span>{activeSurface.title}</span>
           </span>
-          <span
-            style={{
-              fontSize: 11,
-              fontWeight: 600,
-              padding: "3px 8px",
-              borderRadius: 99,
-              background: "rgba(255, 255, 255, 0.06)",
-              color: "var(--text-secondary)",
-            }}
-          >
-            {activeSurface.repo || "auth-svc"}
-          </span>
+          {activeSurface.repo && (
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                padding: "3px 8px",
+                borderRadius: 99,
+                background: "rgba(255, 255, 255, 0.06)",
+                color: "var(--text-secondary)",
+              }}
+            >
+              {activeSurface.repo}
+            </span>
+          )}
         </div>
 
         {/* 0. CONTEXT CARD (Adaptive Domain Card + Universal Fallback) */}
@@ -933,100 +1540,45 @@ export function A2UISurfaceDeck({
           </>
         )}
 
-        {/* 1. PLAN APPROVAL CARD (Human Checkpoint) */}
+        {/* 1. SANDBOX RESPONSE / PLAN CHECKPOINT CARD */}
         {activeSurface.kind === "plan_approval" && (
-          <>
-            {planSteps.length > 0 && (
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 5,
-                  padding: "10px 12px",
-                  borderRadius: 13,
-                  background: "rgba(12, 15, 22, 0.48)",
-                  border: "1px solid rgba(255, 255, 255, 0.06)",
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: 10.5,
-                    fontWeight: 600,
-                    textTransform: "uppercase",
-                    letterSpacing: "0.05em",
-                    color: "var(--text-muted)",
-                    marginBottom: 2,
-                  }}
-                >
-                  Proposed Plan
-                </div>
-                {planSteps.map((step, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      fontSize: 12,
-                      color: "var(--text-secondary)",
-                      display: "flex",
-                      gap: 7,
-                      lineHeight: 1.35,
-                    }}
-                  >
-                    <span style={{ color: "#60a5fa", fontWeight: 600 }}>
-                      {i + 1}.
-                    </span>
-                    <span>{step}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div className="a2ui-options-list">
-              {options.map((optionText) => {
-                const isSelected = currentChoice === optionText;
-                return (
-                  <button
-                    key={optionText}
-                    type="button"
-                    className={`a2ui-option-pill ${isSelected ? "selected" : ""}`}
-                    onClick={() =>
-                      setSelectedOptions((prev) => ({
-                        ...prev,
-                        [activeSurface.surfaceId]: optionText,
-                      }))
-                    }
-                  >
-                    <span>{optionText}</span>
-                    {isSelected && <Check size={15} color="#93c5fd" />}
-                  </button>
-                );
-              })}
-            </div>
-
-            <button
-              type="button"
-              id="approve-execute-plan-btn"
-              className="a2ui-primary-btn"
-              onClick={() =>
-                onApprovePlan(activeSurface.taskId || "task-1", currentChoice)
-              }
-            >
-              Approve &amp; Execute Plan
-            </button>
-          </>
+          <PlanApprovalBody
+            surface={activeSurface}
+            planSteps={planSteps}
+            hasQuestions={hasQuestions}
+            options={options}
+            currentChoice={currentChoice}
+            onSelectChoice={(choice) =>
+              setSelectedOptions((prev) => ({
+                ...prev,
+                [activeSurface.surfaceId]: choice,
+              }))
+            }
+            onApprovePlan={onApprovePlan}
+            onCancelTask={onCancelTask}
+            onDismissSurface={onDismissSurface}
+          />
         )}
 
-        {/* 2. LIVE TRAJECTORY CARD (Autonomous Execution in Progress) */}
+        {/* 2. LIVE SANDBOX ACTIVITY CARD (Real-Time Harness Stream) */}
         {activeSurface.kind === "task_trajectory" && (
           <>
-            <p className="a2ui-subtitle" style={{ color: "#e2e8f0", fontWeight: 500 }}>
-              {activeSurface.subtitle}
-            </p>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <p className="a2ui-subtitle" style={{ color: "#e2e8f0", fontWeight: 500, margin: 0 }}>
+                {activeSurface.subtitle}
+              </p>
+              {trajectoryElapsed > 0 && (
+                <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                  {trajectoryElapsed}s
+                </span>
+              )}
+            </div>
 
             <div
               style={{
                 display: "flex",
                 flexDirection: "column",
-                gap: 10,
+                gap: 9,
                 padding: "12px 14px",
                 borderRadius: 14,
                 background: "rgba(12, 15, 22, 0.52)",
@@ -1065,81 +1617,34 @@ export function A2UISurfaceDeck({
                 </div>
               ))}
             </div>
+
+            {activeSurface.taskId && onCancelTask && (
+              <button
+                type="button"
+                className="a2ui-option-pill"
+                style={{
+                  justifyContent: "center",
+                  fontWeight: 600,
+                  color: "var(--text-secondary)",
+                }}
+                onClick={() => onCancelTask(activeSurface.taskId!)}
+              >
+                Cancel
+              </button>
+            )}
           </>
         )}
 
-        {/* 3. EXECUTIVE OUTCOME CARD (Freshly Completed or Failed Summary, < 10m old) */}
+        {/* 3. SANDBOX OUTCOME CARD (Sleek Artifact Deliverables or Executive Receipt) */}
         {activeSurface.kind === "task_outcome" && (
-          <>
-            <p className="a2ui-subtitle" style={{ color: "#f1f5f9" }}>
-              {activeSurface.subtitle}
-            </p>
-
-            <div
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 8,
-                padding: "9px 12px",
-                borderRadius: 12,
-                background: isOutcomeFailed
-                  ? "rgba(248, 113, 113, 0.12)"
-                  : "rgba(16, 185, 129, 0.12)",
-                border: isOutcomeFailed
-                  ? "1px solid rgba(248, 113, 113, 0.32)"
-                  : "1px solid rgba(16, 185, 129, 0.3)",
-                color: isOutcomeFailed ? "#fca5a5" : "#6ee7b7",
-                fontSize: 12,
-                fontWeight: 600,
-                lineHeight: 1.4,
-              }}
-            >
-              {isOutcomeFailed ? (
-                <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
-              ) : (
-                <CheckCircle2 size={15} style={{ flexShrink: 0, marginTop: 1 }} />
-              )}
-              <span>
-                {isOutcomeFailed
-                  ? (outcomeError || activeSurface.subtitle || "Task failed").slice(0, 180)
-                  : "All tests passed · Changes applied automatically"}
-              </span>
-            </div>
-
-            {outcomeFiles.length > 0 && (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {outcomeFiles.map((file) => (
-                  <span
-                    key={file}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 5,
-                      padding: "4px 9px",
-                      borderRadius: 8,
-                      background: "rgba(255, 255, 255, 0.05)",
-                      border: "1px solid rgba(255, 255, 255, 0.08)",
-                      fontSize: 11,
-                      fontFamily: "var(--font-mono)",
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    <FileCode2 size={12} color="#93c5fd" />
-                    {file}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            <button
-              type="button"
-              className="a2ui-option-pill"
-              style={{ justifyContent: "center", fontWeight: 600 }}
-              onClick={() => onDismissSurface(activeSurface.surfaceId)}
-            >
-              {isOutcomeFailed ? "Dismiss" : "Done"}
-            </button>
-          </>
+          <TaskOutcomeBody
+            surface={activeSurface}
+            isOutcomeFailed={isOutcomeFailed}
+            outcomeError={outcomeError}
+            outcomeVerification={outcomeVerification}
+            outcomeFiles={outcomeFiles}
+            onDismissSurface={onDismissSurface}
+          />
         )}
       </div>
 

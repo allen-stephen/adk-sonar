@@ -61,7 +61,8 @@ RUN uv venv "${VIRTUAL_ENV}" && \
       "codespell>=2.2.0"
 
 # 4. Pre-install Coding Harnesses & stdio MCP servers
-RUN mkdir -p "${NPM_CONFIG_PREFIX}/bin" && \
+RUN mkdir -p "${NPM_CONFIG_PREFIX}/bin" /root/.gemini/antigravity-cli && \
+    printf '{"modelProvider":"gemini"}\n' > /root/.gemini/antigravity-cli/settings.json && \
     npm install -g \
       "@anthropic-ai/claude-code@latest" \
       "@modelcontextprotocol/server-slack" \

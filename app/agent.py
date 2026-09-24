@@ -47,17 +47,17 @@ from app.tools.integration_tools import (
     slack_messages,
     spotify_playback,
 )
+from app.tasks.persistence import is_store_active, mark_handle_event_seen
 from app.tools.task_tools import (
     approve_task,
     cancel_task,
     dispatch_task,
+    format_task_completion_for_voice,
     get_task_result,
     list_harnesses,
     list_tasks,
     set_coding_harness,
     steer_task,
-    stop_streaming,
-    watch_tasks,
 )
 from app.tools.workspace_tools import (
     create_or_clone_repository,
@@ -70,32 +70,105 @@ from app.tools.workspace_tools import (
 MODEL = os.getenv("LIVE_MODEL", "gemini-3.8-live")
 
 
+def _extract_dispatched_or_steered_task_id(
+    func_name: str,
+    result: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> str | None:
+    """Resolve the task_id started or resumed by dispatch_task / steer_task."""
+    if not isinstance(result, str):
+        return None
+    if func_name == "dispatch_task" and result.startswith("Started task-"):
+        parts = result.split()
+        return parts[1].strip().lower() if len(parts) > 1 else None
+    if func_name == "steer_task" and (
+        result.startswith("Resumed ") or result.startswith("Switched ")
+    ):
+        raw_id = kwargs.get("task_id") or (args[0] if args else None)
+        return str(raw_id).strip().lower() if raw_id else None
+    return None
+
+
 def non_blocking_tool(
     func: Any,
     scheduling: types.FunctionResponseScheduling = types.FunctionResponseScheduling.WHEN_IDLE,
 ) -> FunctionTool:
     """Wrap an async function as a Gemini Live API NON_BLOCKING streaming FunctionTool.
 
-    In ADK (`google/adk/flows/llm_flows/functions.py` lines 1181-1292), wrapping `func`
-    as an async generator (`inspect.isasyncgenfunction`) instructs ADK to:
-    1. Advertise `declaration.behavior = types.Behavior.NON_BLOCKING` to the Gemini Live API.
-    2. Immediately return `{'status': 'The function is running asynchronously and the results are pending.'}`
-       in <1ms so the voice model speaks an immediate acknowledgment without dead air.
-    3. Execute `func` in a background `asyncio.Task` (`run_tool_and_update_queue`) and push the
-       completed `FunctionResponse` into `live_request_queue` with `FunctionResponseScheduling.WHEN_IDLE`.
+    CRITICAL ADK LIVE SCHEDULING DETAIL (`google/adk/flows/llm_flows/functions.py` lines 1287 & 1629-1635):
+    When an async generator tool is called, ADK immediately emits a placeholder
+    `{'status': 'The function is running asynchronously and the results are pending.'}` stamped
+    with `tool.response_scheduling`. If `tool.response_scheduling` is `WHEN_IDLE`, Gemini Live
+    triggers a SECOND model turn as soon as the initial `function_call` utterance ends, causing
+    the voice agent to repeat "Kicking off task..." twice verbatim!
+    Therefore:
+    1. `tool.response_scheduling` MUST be `FunctionResponseScheduling.SILENT` so ADK's initial
+       `pending` placeholder (and the immediate `Started task-N` context update) never triggers
+       a duplicate spoken turn.
+    2. Only the actual completion `FunctionResponse` yielded after the work finishes sets
+       `scheduling=scheduling` (`WHEN_IDLE`), which overrides `tool.response_scheduling` at
+       `functions.py:1605` and prompts the model to speak once the result is ready.
     """
     if not inspect.isasyncgenfunction(func):
+        func_name = getattr(func, "__name__", "")
 
         @functools.wraps(func)
         async def _async_gen_wrapper(*args: Any, **kwargs: Any):
             result = await func(*args, **kwargs)
-            yield result
+            task_id = _extract_dispatched_or_steered_task_id(
+                func_name, result, args, kwargs
+            )
+            if not task_id:
+                yield types.FunctionResponse(
+                    name=func_name,
+                    response={"result": result},
+                    scheduling=scheduling,
+                )
+                return
+
+            from app.tasks import get_task_registry
+
+            handle = await get_task_registry().get(task_id)
+            if handle is None or handle.async_task is None:
+                yield types.FunctionResponse(
+                    name=func_name,
+                    response={"result": result},
+                    scheduling=types.FunctionResponseScheduling.SILENT,
+                )
+                return
+
+            handle.awaited_by_live_tool = True
+            try:
+                # Yield #1 (SILENT): record task_id and branch in model context without triggering a 2nd spoken turn after kickoff.
+                yield types.FunctionResponse(
+                    name=func_name,
+                    response={"result": result},
+                    scheduling=types.FunctionResponseScheduling.SILENT,
+                )
+                await asyncio.shield(handle.async_task)
+                await mark_handle_event_seen(handle)
+                if (
+                    not getattr(handle, "dismissed", False)
+                    and handle.status
+                    in {"completed", "failed", "awaiting_input", "awaiting_approval"}
+                ):
+                    # Yield #2 (WHEN_IDLE): trigger a single concise spoken headline once the sandbox run finishes or hits a gate.
+                    yield types.FunctionResponse(
+                        name=func_name,
+                        response={"result": format_task_completion_for_voice(handle)},
+                        scheduling=scheduling,
+                    )
+            finally:
+                handle.awaited_by_live_tool = False
 
         _async_gen_wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
         tool = FunctionTool(_async_gen_wrapper)
     else:
         tool = FunctionTool(func)
-    tool.response_scheduling = scheduling
+    # Set tool-wide default to SILENT so ADK's initial `pending` placeholder (`functions.py:1287`)
+    # does not force Gemini Live to repeat the kickoff announcement a second time.
+    tool.response_scheduling = types.FunctionResponseScheduling.SILENT
     return tool
 
 
@@ -107,49 +180,124 @@ _mcp_toolsets = (
     else []
 )
 
+# Maximum age for resumable checkpoints (awaiting_input / awaiting_approval) in the voice briefing.
+_BRIEFING_CHECKPOINT_MAX_AGE_SECONDS = 86400.0
+
+
 async def _hydrate_task_store_callback(callback_context: Any) -> None:
-    """Hydrates persisted tasks from TaskStore before the turn so _build_task_briefing sees all records."""
+    """Hydrates persisted tasks and drains unseen completion/error events once per session turn."""
     try:
         from app.tasks import get_task_registry
 
-        await get_task_registry().list_all()
+        reg = get_task_registry()
+        # Capture the active LiveRequestQueue if running inside a Gemini Live session
+        inv_ctx = None
+        if hasattr(callback_context, "get_invocation_context"):
+            try:
+                inv_ctx = callback_context.get_invocation_context()
+            except Exception:
+                inv_ctx = None
+        if inv_ctx is None:
+            inv_ctx = getattr(callback_context, "_invocation_context", None)
+        if inv_ctx is not None and getattr(inv_ctx, "live_request_queue", None) is not None:
+            reg.active_live_queue = inv_ctx.live_request_queue
+
+        await reg.list_all()
+
+        if is_store_active():
+            from app.store.task_store import get_task_store
+
+            store = get_task_store()
+            unseen = await store.get_unseen_events("default-user", limit=10)
+            if unseen:
+                max_event_id = max(ev.id for ev in unseen)
+                by_short: dict[str, str] = {}
+                for ev in unseen:
+                    meta = ev.metadata_json or {}
+                    short_id = meta.get("short_id")
+                    if not short_id:
+                        continue
+                    handle = reg._tasks.get(short_id)
+                    if handle is not None and (
+                        getattr(handle, "dismissed", False)
+                        or handle.status in {"orphaned", "cancelled", "awaiting_input", "awaiting_approval"}
+                    ):
+                        continue
+                    repo = meta.get("repo") or (handle.repo if handle else "workspace")
+                    if ev.kind == "completed":
+                        by_short[short_id] = (
+                            f"- {short_id} on {repo}: finished while you were away ({(ev.message or '').strip()[:160]})"
+                        )
+                    elif ev.kind == "error":
+                        by_short[short_id] = (
+                            f"- {short_id} on {repo}: failed while you were away ({(ev.message or '').strip()[:160]})"
+                        )
+                if by_short:
+                    reg._unseen_briefing_items = list(by_short.values())[-3:]  # type: ignore[attr-defined]
+                await store.advance_cursor("default-user", max_event_id)
     except Exception:
         pass
 
 
 def _build_task_briefing() -> str:
-    """Dynamically builds a concise spoken briefing of active or recently completed tasks."""
+    """Dynamically builds a bounded, non-repetitive spoken briefing of active and unseen tasks."""
     try:
+        import time
         from app.tasks import get_task_registry
 
         reg = get_task_registry()
         tasks = reg.snapshot_tasks()
-        if not tasks:
-            return ""
+        now = time.time()
 
         active_items: list[str] = []
         for t in tasks:
-            if t.status == "awaiting_approval":
+            if getattr(t, "dismissed", False) or t.status in {"orphaned", "cancelled"}:
+                continue
+            age = now - (t.ended_at_ts or t.created_at_ts or now)
+            if t.status == "awaiting_approval" and age <= _BRIEFING_CHECKPOINT_MAX_AGE_SECONDS:
                 active_items.append(
                     f"- {t.task_id} on {t.repo}: changes ready for review and diff approval on branch {t.branch}"
                 )
-            elif t.status == "awaiting_input":
+            elif t.status == "awaiting_input" and age <= _BRIEFING_CHECKPOINT_MAX_AGE_SECONDS:
                 qs = ", ".join(t.questions[:2]) if t.questions else "clarification required"
                 active_items.append(
-                    f"- {t.task_id} on {t.repo}: waiting for user guidance ({qs})"
+                    f"- {t.task_id} on {t.repo}: waiting for user guidance ({qs[:160]})"
                 )
-            elif t.status == "running":
+            elif (
+                t.status == "running"
+                and not getattr(t, "from_history", False)
+                and t.async_task is not None
+                and not t.async_task.done()
+            ):
                 active_items.append(
                     f"- {t.task_id} on {t.repo}: currently running ({t.harness})"
                 )
 
-        if not active_items:
-            recent = [t for t in tasks if t.status == "completed"]
-            if recent:
-                last = recent[-1]
-                active_items.append(
-                    f"- {last.task_id} on {last.repo}: recently completed ({last.summary or 'all changes verified'})"
+            elif (
+                t.status == "completed"
+                and not getattr(t, "from_history", False)
+                and not getattr(t, "dismissed", False)
+                and age <= 600.0
+            ):
+                files_note = (
+                    f", modified {', '.join(t.files_changed[:3])}"
+                    if t.files_changed
+                    else ""
                 )
+                short_summary = " ".join((t.summary or "changes applied").strip().split())[:160]
+                active_items.append(
+                    f"- {t.task_id} on {t.repo} (branch {t.branch}, harness {t.harness}): "
+                    f"recently completed work pass ({short_summary}{files_note}) — "
+                    f"warm session, can be continued via `steer_task(task_id='{t.task_id}', ...)` if the user asks for follow-up work"
+                )
+
+        active_items = active_items[:4]
+
+        # Drain unseen completion/failure events captured from TaskStore cursor watermark
+        unseen_items: list[str] = list(getattr(reg, "_unseen_briefing_items", []) or [])
+        if unseen_items:
+            reg._unseen_briefing_items = []  # type: ignore[attr-defined]
+            active_items.extend(unseen_items[:3])
 
         if not active_items:
             return ""
@@ -175,10 +323,14 @@ def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
     style_rule = style_map.get(prefs["speech_style"], style_map["concise"])
 
     return (
-        "You are a concise, pragmatic voice-driven engineering and workspace orchestrator.\n"
-        "You coordinate concurrent coding agents inside an isolated Vertex Agent Platform Sandbox "
-        "(using per-task git worktrees across configurable harnesses such as Claude Code, ADK Long Horizon, "
-        "and Antigravity) while also operating across a dynamic set of workspace, grounding, and MCP integration tools.\n\n"
+        "You are Sonar, a sharp, warm, and pragmatic live voice collaborator.\n"
+        "You talk like a trusted human peer and co-pilot—natural, grounded, and direct—while seamlessly handling "
+        "everyday questions, music, places, personal schedule and inbox, or background agent runs in a cloud sandbox "
+        "(across Claude Code, ADK Long Horizon, and Antigravity).\n\n"
+        "GREETINGS & CONVERSATIONAL PERSONA:\n"
+        "- When the user greets you casually (such as 'Hi there', 'Hey', or 'Good morning'), reply like a warm, natural human peer in one short sentence (for example: 'Hey! What's on your mind?' or 'Hey there — what are we getting into?').\n"
+        "- NEVER use scripted assistant clichés or recite capability menus (NEVER say 'How can I help you with your workspace or coding tasks today?', 'How may I assist you today?', or 'I am your engineering and workspace orchestrator').\n"
+        "- Only mention background tasks during a greeting if there is an active or newly finished run in your situational briefing below that genuinely needs their attention.\n\n"
         f"{task_briefing}"
         "USER TIMEZONE & TEMPORAL CONTEXT:\n"
         f"- Active User Timezone: {prefs['timezone']} ({prefs['tz_abbrev']}, {prefs['tz_offset']})\n"
@@ -198,10 +350,9 @@ def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
         "- Multi-step software engineering, codebase architecture/review, cloud evaluation/deployment (`agents-cli`), or deep research and artifact synthesis -> call `dispatch_task(goal=..., repo=..., mode=..., harness=..., require_approval=...)`.\n\n"
         "ASYNC TOOL ACKNOWLEDGMENT vs. SYNCHRONOUS TOOL EXECUTION:\n"
         "- Asynchronous Non-Blocking Tools (`dispatch_task`, `steer_task`, `approve_task`, `search_web_grounded`, `search_maps_grounded`): "
-        "These tools immediately return `The function is running asynchronously and the results are pending`. Whenever you call one of these five tools, "
-        "ALWAYS speak a brief one-sentence acknowledgment aloud immediately (for example, 'Checking the web for the latest Python release notes.' "
-        "or 'Checking Google Maps for quiet coffee shops in downtown Austin.' or 'Spinning up a Claude Code plan task on auth service now.'), "
-        "and then summarize the outcome once the background result arrives.\n"
+        "When you invoke one of these five tools, speak a brief one-sentence kickoff acknowledgment ONCE in that same turn (for example, 'Checking the web for the latest Python release notes.' "
+        "or 'On it — having Claude draft a plan for auth service now.'). "
+        "CRITICAL: When `The function is running asynchronously and the results are pending` or `Started task-N` is returned, NEVER repeat your kickoff sentence a second time — stay completely silent until the final completed result or plan questions arrive.\n"
         "- Synchronous Direct Lookup Tools (`spotify_playback`, `calendar_events`, `gmail_messages`, `drive_files`, `slack_messages`, `github_operations`, `list_repositories`, `list_harnesses`, `get_task_result`, `get_current_time_and_timezone`): "
         "These tools return their full result immediately. NEVER speak a pre-tool 'Let me check...' filler before or during these calls; invoke the tool silently first and speak ONLY the grounded answer or credential message returned by the tool.\n\n"
         "ITERATIVE PLANNING, SANDBOX SKILLS & ORCHESTRATION GUIDELINES:\n"
@@ -215,6 +366,9 @@ def build_orchestrator_instruction(readonly_context: ReadonlyContext) -> str:
         "never auto-steer in the same turn. Walk the user concisely through the returned plan summary, key steps, and trade-off questions so they understand what the harness proposes. "
         "If the user wants to explore an alternate approach, critique an assumption, or adjust the scope before approving, call `steer_task(task_id=..., instruction=..., mode='plan')` "
         "to revise the plan in the same sandbox session. Only call `steer_task(task_id=..., instruction=..., mode='execute')` once the user confirms they are ready to execute (including any cloud deployments via `agents-cli deploy`).\n"
+        "- Post-Execution Warm Continuation (`steer_task` after `completed`): When a coding or multi-step sandbox task finishes an execution pass, its git worktree (`agent/task-N`) and harness session remain warm. "
+        "Report what work was completed and naturally offer to either keep going on that same task (such as adding tests, reviewing the diff with another harness, or opening a pull request via `steer_task(task_id=..., instruction=..., mode='execute')`) or wrap it up if the atomic goal is done. "
+        "Whenever the user asks to do follow-up work on a recently completed task, always resume that task with `steer_task` instead of creating a separate `dispatch_task`.\n"
         "- Last-Mile Delivery Across Integrations: When a sandbox task completes a research brief, shopping list, or engineering summary that the user wants emailed or posted to chat, "
         "retrieve the output with `get_task_result` and deliver it via `gmail_messages` or `slack_messages`.\n"
         "- Human-in-the-Loop Approval & Diff Compression: When a task pauses in `awaiting_approval` with a diff, "
@@ -291,8 +445,6 @@ root_agent = Agent(
         set_coding_harness,
         list_tasks,
         cancel_task,
-        watch_tasks,
-        stop_streaming,
         list_repositories,
         inspect_repository_files,
         read_workspace_file,
@@ -343,6 +495,4 @@ __all__ = [
     "slack_messages",
     "spotify_playback",
     "steer_task",
-    "stop_streaming",
-    "watch_tasks",
 ]

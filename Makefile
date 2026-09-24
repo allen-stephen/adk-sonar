@@ -58,10 +58,24 @@ test:
 # Run ADK Live evaluation suite (override dataset with: make eval DATASET=tests/eval/datasets/coding-tasks.json)
 EVAL_DB_URL ?= sqlite+aiosqlite:////tmp/sonar_eval_tasks.db
 DATASET ?= tests/eval/datasets/basic-dataset.json
+HARNESS ?= claude
+SANDBOX_DATASET ?= tests/eval/sandbox/sandbox_dataset.json
 
 eval:
 	TASK_DB_URL=$(EVAL_DB_URL) uv run python tests/eval/seed_eval_store.py
 	PYTHONPATH=tests/eval:. TASK_DB_URL=$(EVAL_DB_URL) agents-cli eval run --mode adk_live --dataset $(DATASET) --config tests/eval/eval_config.yaml
+
+# Run L1 live sandbox harness evaluation (HARNESS=claude|antigravity|horizon|all) and grade with agents-cli
+eval-sandbox:
+	uv run python tests/eval/sandbox/run_sandbox_eval.py --harness $(HARNESS) --dataset $(SANDBOX_DATASET) $(SANDBOX_EVAL_FLAGS)
+	@for h in $$(if [ "$(HARNESS)" = "all" ]; then echo "claude antigravity horizon"; else echo "$(HARNESS)"; fi); do \
+		echo "=== Grading sandbox traces for $$h ==="; \
+		uv run agents-cli eval grade --traces artifacts/sandbox_traces/$$h --config tests/eval/sandbox/sandbox_eval_config.yaml --output artifacts/grade_results/sandbox_$$h; \
+	done
+
+# Compare two graded sandbox runs (e.g., make eval-sandbox-compare BASELINE=artifacts/grade_results/sandbox_claude/results_...json CANDIDATE=artifacts/grade_results/sandbox_antigravity/results_...json)
+eval-sandbox-compare:
+	uv run agents-cli eval compare $(BASELINE) $(CANDIDATE)
 
 # ==============================================================================
 # 3. GRANULAR HELPERS

@@ -164,9 +164,9 @@ def record_context_surface(
             }
         },
     }
-    # Keep newest context surface at index 0 (max 4 recent context cards)
+    # Keep only the single latest active context surface so the canvas never piles up across turns
     _context_surfaces.insert(0, surface)
-    del _context_surfaces[4:]
+    del _context_surfaces[1:]
 
 
 def _mask_secret(val: str | None) -> str | None:
@@ -178,42 +178,170 @@ def _mask_secret(val: str | None) -> str | None:
     return f"{val[:3]}••••{val[-4:]}"
 
 
+def _clean_summary_prose(
+    raw_text: str | None, fallback: str = "", max_chars: int = 200
+) -> str:
+    """Strip internal URIs, GCP resource paths, and raw markdown to produce a concise 1-2 sentence summary."""
+    import re
+
+    if not raw_text or not raw_text.strip():
+        return fallback
+    txt = raw_text.strip()
+    # Replace markdown links `[label](url)` with `label` (handles file://, /lha/..., https://, etc.)
+    txt = re.sub(r"📎?\s*\[([^\]]+)\]\([^\)]*\)", r"\1", txt)
+    # Strip standalone URLs (raw git commit URLs, lha URIs, etc.)
+    txt = re.sub(r"\(?https?://[^\s\)]+\)?", "", txt)
+    txt = re.sub(r"\(?(?:file://|/lha/workspace/download)[^\s\)]+\)?", "", txt)
+    # Strip raw GCP resource paths and internal sandbox debug annotations
+    txt = re.sub(r"projects/\d+/locations/\S+", "Vertex Sandbox", txt)
+    txt = re.sub(r"\(X-Sandbox-Port:[^\)]*\)", "", txt)
+    # Remove boilerplate like "You can verify the updated files here: - ..." if artifacts are already shown below
+    txt = re.sub(
+        r"You can verify the (?:updated |created )?files here:.*?(?=(?:Let me know|$))",
+        "",
+        txt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Take the first non-heading, non-table paragraph line when given a multi-paragraph markdown document
+    paragraphs = [
+        re.sub(r"^#+\s*", "", ln).strip()
+        for ln in txt.splitlines()
+        if ln.strip()
+        and not ln.strip().startswith(("```", "|", "---", "###", "##"))
+    ]
+    first_para = paragraphs[0] if paragraphs else txt
+    # Strip raw markdown bold/code markers
+    first_para = first_para.replace("**", "").replace("__", "").replace("`", "")
+    first_para = re.sub(r"\s{2,}", " ", first_para).strip(" -•:")
+    if not first_para:
+        return fallback
+    if len(first_para) <= max_chars:
+        return first_para
+    # Extract first 1-2 sentences within max_chars
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", first_para) if s.strip()]
+    if sentences and len(sentences[0]) <= max_chars:
+        summary = sentences[0]
+        if len(sentences) > 1 and len(summary) + 1 + len(sentences[1]) <= max_chars:
+            summary = f"{summary} {sentences[1]}"
+        return summary
+    return first_para[: max_chars - 1].rstrip() + "…"
+
+
+def _clean_milestone_label(raw_label: str | None, fallback: str = "") -> str:
+    """Sanitize a single trajectory milestone line so it never leaks GCP resource paths or raw download URLs."""
+    import re
+
+    if not raw_label or not raw_label.strip():
+        return fallback
+    lbl = raw_label.strip()
+    lbl = re.sub(
+        r"📎?\s*\[([^\]]+)\]\(/lha/workspace/download[^\)]*\)",
+        r"Generated \1",
+        lbl,
+    )
+    lbl = re.sub(r"projects/\d+/locations/\S+", "Vertex Sandbox", lbl)
+    lbl = re.sub(r"\(X-Sandbox-Port:[^\)]*\)", "", lbl)
+    lbl = _clean_summary_prose(lbl, fallback=fallback, max_chars=95)
+    return lbl or fallback
+
+
+def _extract_clean_plan_steps(raw_text: str | None, fallback_goal: str) -> list[str]:
+    """Extract at most 3 concise, readable steps or takeaways from a harness's response text."""
+    import re
+
+    if not raw_text or not raw_text.strip():
+        return [f"Goal: {fallback_goal}"]
+    cleaned: list[str] = []
+    for raw_ln in raw_text.strip().splitlines():
+        s = raw_ln.strip()
+        if not s or s.startswith(("```", "|", "---")):
+            continue
+        # Prefer headings or bullet items when summarizing structured markdown documents
+        is_heading_or_bullet = s.startswith(("#", "-", "*", "•")) or (
+            len(s) > 3 and s[0].isdigit() and s[1] in (".", ")")
+        )
+        s = re.sub(r"^(?:#+|\d+[\.\)]|[-*•])\s*", "", s).strip()
+        s = _clean_summary_prose(s, max_chars=110)
+        if s and len(s) > 3 and (is_heading_or_bullet or len(cleaned) == 0):
+            if s not in cleaned:
+                cleaned.append(s)
+        if len(cleaned) >= 3:
+            break
+    return cleaned or [_clean_summary_prose(raw_text, fallback_goal, max_chars=120)]
+
+
 def _build_task_milestones(handle: TaskHandle) -> list[dict[str, str]]:
-    """Builds a 3-step high-level trajectory for a task."""
+    """Builds a real-time trajectory from the harness's actual streamed events and state."""
     status = handle.status
+    recent_events = [
+        _clean_milestone_label(ev)
+        for ev in (handle.events or [])
+        if ev and ev.strip()
+    ]
+    recent_events = [ev for ev in recent_events if ev]
+    # Deduplicate consecutive identical event labels
+    deduped_events: list[str] = []
+    for ev in recent_events:
+        if not deduped_events or deduped_events[-1] != ev:
+            deduped_events.append(ev)
+
     if status == "awaiting_input":
-        return [
-            {"label": f"Inspected {handle.repo} repository structure", "state": "done"},
-            {"label": "Drafted implementation plan & options", "state": "done"},
-            {"label": "Awaiting your approval to execute changes", "state": "active"},
-        ]
-    if status == "running":
-        active_step = (
-            handle.latest_update
-            or f"Applying changes & running test suite in {handle.repo}..."
+        steps = [{"label": ev, "state": "done"} for ev in deduped_events[-2:]]
+        if not steps:
+            steps.append(
+                {
+                    "label": f"Completed {handle.mode} pass in {handle.repo} ({handle.harness})",
+                    "state": "done",
+                }
+            )
+        steps.append(
+            {
+                "label": _clean_summary_prose(handle.summary, "Waiting for your confirmation or direction", max_chars=95),
+                "state": "active",
+            }
+        )
+        return steps
+
+    if status == "awaiting_approval":
+        diff_label = (
+            handle.diff_summary
+            or (f"{len(handle.files_changed)} file(s) modified" if handle.files_changed else "Changes ready for review")
         )
         return [
-            {"label": f"Plan locked for {handle.repo}", "state": "done"},
-            {"label": active_step, "state": "active"},
-            {"label": "Verify test suite & finalize branch", "state": "pending"},
+            {"label": f"Executed in sandbox worktree ({handle.branch or handle.repo})", "state": "done"},
+            {"label": diff_label, "state": "done"},
+            {"label": handle.pending_action or "Awaiting your approval to commit", "state": "active"},
         ]
+
+    if status == "running":
+        steps = [{"label": ev, "state": "done"} for ev in deduped_events[:-1][-2:]]
+        active_label = (
+            _clean_milestone_label(handle.latest_update)
+            or (deduped_events[-1] if deduped_events else None)
+            or f"Running {handle.harness} ({handle.mode} mode)..."
+        )
+        steps.append({"label": active_label, "state": "active"})
+        return steps
+
     if status == "completed":
-        return [
-            {"label": f"Plan approved for {handle.repo}", "state": "done"},
-            {"label": "Applied code changes & verified test suite", "state": "done"},
-            {"label": handle.summary or "Changes committed automatically", "state": "done"},
-        ]
+        steps = [{"label": ev, "state": "done"} for ev in deduped_events[-2:]]
+        final_label = _clean_summary_prose(handle.summary, "Completed in Vertex Sandbox", max_chars=95)
+        if not steps or steps[-1]["label"] != final_label:
+            steps.append({"label": final_label, "state": "done"})
+        return steps
+
     if status == "failed":
         return [
-            {"label": f"Dispatched {handle.harness} on {handle.repo}", "state": "done"},
-            {"label": handle.error or handle.summary or "Execution failed", "state": "active"},
+            {"label": f"Dispatched {handle.harness}", "state": "done"},
+            {"label": _clean_milestone_label(handle.error or handle.summary, "Execution failed"), "state": "active"},
         ]
+
     return [
-        {"label": f"Task {status} on {handle.repo}", "state": "done"},
+        {"label": f"{handle.harness} ({status})", "state": "done"},
     ]
 
 
-# Terminal tasks older than 10 minutes (600s) or explicitly dismissed move to the Ledger
+# Terminal tasks older than 10 minutes (600s), hydrated from prior server runs, or explicitly dismissed move to the Ledger
 STALE_TERMINAL_SECONDS = 600
 
 
@@ -224,10 +352,13 @@ def _serialize_task(handle: TaskHandle) -> dict[str, Any]:
     ref_ts = handle.ended_at_ts or handle.created_at_ts or now_ts
     age_seconds = max(0, int(now_ts - ref_ts))
     surface_id = f"a2ui-{handle.task_id}"
-    is_dismissed = surface_id in _dismissed_surfaces
+    is_dismissed = bool(handle.dismissed or surface_id in _dismissed_surfaces)
     is_terminal = handle.status in ("completed", "failed", "cancelled", "orphaned")
+    # Any task hydrated from a prior server run (`from_history=True`) or dismissed belongs in the Ledger, not the live stage
     is_stale = bool(
-        is_terminal and (is_dismissed or age_seconds > STALE_TERMINAL_SECONDS)
+        handle.from_history
+        or is_dismissed
+        or (is_terminal and age_seconds > STALE_TERMINAL_SECONDS)
     )
     return {
         "task_id": handle.task_id,
@@ -241,12 +372,14 @@ def _serialize_task(handle: TaskHandle) -> dict[str, Any]:
         "created_at": handle.created_at_ts,
         "ended_at": handle.ended_at_ts,
         "age_seconds": age_seconds,
+        "from_history": handle.from_history,
         "is_dismissed": is_dismissed,
         "is_stale": is_stale,
         "summary": handle.summary,
         "response_text": handle.response_text,
         "error": handle.error,
         "files_changed": list(handle.files_changed or []),
+        "artifacts": list(getattr(handle, "artifacts", None) or []),
         "questions": list(handle.questions or []),
         "awaiting_input": handle.awaiting_input,
         "awaiting_approval": handle.awaiting_approval,
@@ -257,6 +390,39 @@ def _serialize_task(handle: TaskHandle) -> dict[str, Any]:
         "events": list(handle.events or []),
         "milestones": _build_task_milestones(handle),
     }
+
+
+def _clean_repo_badge(repo: str | None) -> str:
+    if not repo or repo.strip().lower() in ("current", "default-repo"):
+        return ""
+    return repo.strip()
+
+
+def _resolve_task_artifacts(t: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return task artifacts, synthesizing a markdown artifact when a harness returns a long response without files."""
+    import re
+
+    existing = list(t.get("artifacts") or [])
+    if existing:
+        return existing
+    raw_doc = (t.get("response_text") or t.get("summary") or "").strip()
+    if len(raw_doc) <= 260:
+        return []
+    heading_match = re.search(r"^#{1,3}\s+(.+)$", raw_doc, flags=re.MULTILINE)
+    doc_title = (
+        heading_match.group(1).strip().strip("*`")
+        if heading_match
+        else (t.get("goal") or "Task Deliverable")[:64]
+    )
+    return [
+        {
+            "name": "plan.md" if t.get("status") == "awaiting_input" else "deliverable.md",
+            "title": doc_title,
+            "kind": "markdown",
+            "content": raw_doc[:24000],
+            "line_count": raw_doc.count("\n") + 1,
+        }
+    ]
 
 
 def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -285,10 +451,19 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if surface_id in _dismissed_surfaces or t.get("is_stale"):
             continue
 
+        repo_badge = _clean_repo_badge(t.get("repo"))
+        artifacts_list = _resolve_task_artifacts(t)
+
         if status == "awaiting_approval":
-            diff_text = t.get("diff_summary") or t.get("summary") or "Changes ready for review."
-            plan_steps = [diff_text]
-            options = ["Approve & Commit Changes", "Request Revisions"]
+            diff_text = (
+                t.get("diff_summary")
+                or t.get("summary")
+                or "Changes ready for review in sandbox worktree."
+            )
+            plan_steps = _extract_clean_plan_steps(
+                t.get("response_text") or diff_text, t["goal"]
+            )
+            staged_branch = t.get("branch") or "staged branch"
             surfaces.append(
                 {
                     "version": "v0.9.1",
@@ -296,21 +471,17 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/adk-sonar/catalog.json",
                     "kind": "plan_approval",
                     "taskId": tid,
-                    "repo": t["repo"],
+                    "repo": repo_badge,
                     "harness": t["harness"],
-                    "title": f"{tid.upper()} · APPROVAL REQUIRED",
-                    "subtitle": t.get("pending_action") or f"Diff ready for approval on {t['repo']}",
+                    "title": "APPROVAL REQUIRED",
+                    "subtitle": _clean_summary_prose(
+                        f"Changes staged on branch {staged_branch}.", t["goal"]
+                    ),
                     "components": [
                         {
                             "id": "plan-steps",
                             "component": "PlanSteps",
                             "steps": plan_steps,
-                        },
-                        {
-                            "id": "choice-group",
-                            "component": "MultipleChoice",
-                            "options": options,
-                            "value": {"path": "/plan/selectedOption"},
                         },
                         {
                             "id": "approve-btn",
@@ -325,22 +496,22 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "dataModel": {
                         "plan": {
                             "steps": plan_steps,
-                            "selectedOption": options[0],
-                            "options": options,
+                            "selectedOption": "",
+                            "options": [],
+                            "hasQuestions": False,
+                            "diffSummary": t.get("diff_summary"),
+                            "filesChanged": t.get("files_changed") or [],
+                            "artifacts": artifacts_list,
                             "goal": t["goal"],
                         }
                     },
                 }
             )
         elif status == "awaiting_input":
-            questions = t.get("questions") or [
-                "Review plan and proceed",
-                "Request alternate approach",
-            ]
-            plan_steps = (
-                [t["summary"]]
-                if t.get("summary")
-                else [f"Proposed implementation plan for {t['repo']}"]
+            raw_questions = [q for q in (t.get("questions") or []) if q and q.strip()]
+            options = raw_questions or ["Approve and execute plan"]
+            plan_steps = _extract_clean_plan_steps(
+                t.get("response_text") or t.get("summary"), t["goal"]
             )
             surfaces.append(
                 {
@@ -349,11 +520,10 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/adk-sonar/catalog.json",
                     "kind": "plan_approval",
                     "taskId": tid,
-                    "repo": t["repo"],
+                    "repo": repo_badge,
                     "harness": t["harness"],
-                    "title": f"{tid.upper()} · PLAN APPROVAL",
-                    "subtitle": t.get("summary")
-                    or f"Proposed implementation plan for {t['repo']}",
+                    "title": f"{t['harness'].upper()} PLAN",
+                    "subtitle": _clean_summary_prose(t.get("summary"), t["goal"]),
                     "components": [
                         {
                             "id": "plan-steps",
@@ -363,7 +533,7 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         {
                             "id": "choice-group",
                             "component": "MultipleChoice",
-                            "options": questions,
+                            "options": options,
                             "value": {"path": "/plan/selectedOption"},
                         },
                         {
@@ -380,14 +550,18 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "dataModel": {
                         "plan": {
                             "steps": plan_steps,
-                            "selectedOption": questions[0],
-                            "options": questions,
+                            "selectedOption": options[0],
+                            "options": options,
+                            "hasQuestions": len(raw_questions) > 0,
+                            "responseText": _clean_summary_prose(t.get("response_text") or t.get("summary"), t["goal"]),
+                            "artifacts": artifacts_list,
                             "goal": t["goal"],
                         }
                     },
                 }
             )
         elif status == "running":
+            mode_badge = "PLANNING" if t.get("mode") == "plan" else "IN PROGRESS"
             surfaces.append(
                 {
                     "version": "v0.9.1",
@@ -395,9 +569,9 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/adk-sonar/catalog.json",
                     "kind": "task_trajectory",
                     "taskId": tid,
-                    "repo": t["repo"],
+                    "repo": repo_badge,
                     "harness": t["harness"],
-                    "title": f"{tid.upper()} · EXECUTING",
+                    "title": mode_badge,
                     "subtitle": t["goal"],
                     "components": [
                         {
@@ -408,6 +582,9 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ],
                     "dataModel": {
                         "trajectory": {
+                            "mode": t.get("mode", "execute"),
+                            "branch": t.get("branch"),
+                            "latestUpdate": _clean_milestone_label(t.get("latest_update")),
                             "elapsedSeconds": t["elapsed_seconds"],
                             "milestones": t["milestones"],
                         }
@@ -415,11 +592,18 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 }
             )
         elif status in ("completed", "failed", "cancelled", "orphaned"):
-            outcome_title = f"{tid.upper()} · {status.upper()}"
+            outcome_title = f"{status.upper()}"
             is_ok = status == "completed"
+            files_list = t.get("files_changed") or []
+            clean_subtitle = _clean_summary_prose(
+                t.get("response_text") or t.get("summary"),
+                t["goal"],
+            )
             verification = (
-                t.get("summary")
-                or ("All tests passed · Changes applied" if is_ok else f"Task ended with status {status}")
+                f"{len(files_list)} {'file' if len(files_list) == 1 else 'files'} updated"
+                + (f" in {repo_badge}" if repo_badge else "")
+                if (is_ok and files_list)
+                else ("Completed" if is_ok else f"Task {status}")
             )
             surfaces.append(
                 {
@@ -428,16 +612,15 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "catalogId": "https://a2ui.org/specification/v0_9_1/catalogs/adk-sonar/catalog.json",
                     "kind": "task_outcome",
                     "taskId": tid,
-                    "repo": t["repo"],
+                    "repo": repo_badge,
                     "harness": t["harness"],
                     "title": outcome_title,
-                    "subtitle": t.get("summary")
-                    or (f"All changes applied in {t['repo']}." if is_ok else f"Task {status}."),
+                    "subtitle": clean_subtitle,
                     "components": [
                         {
                             "id": "outcome-summary",
                             "component": "OutcomeSummary",
-                            "files": t.get("files_changed") or [],
+                            "files": files_list,
                         }
                     ],
                     "dataModel": {
@@ -445,9 +628,11 @@ def _build_a2ui_surfaces(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             "status": status,
                             "error": t.get("error"),
                             "goal": t.get("goal"),
+                            "responseText": clean_subtitle,
                             "ageSeconds": t.get("age_seconds", 0),
                             "verification": verification,
-                            "files": t.get("files_changed") or [],
+                            "files": files_list,
+                            "artifacts": artifacts_list,
                             "milestones": t["milestones"],
                         }
                     },
@@ -687,13 +872,17 @@ async def api_provision_harness(harness_name: str) -> dict[str, Any]:
 
 @router.post("/tasks")
 async def api_create_task(req: CreateTaskRequest) -> dict[str, Any]:
+    import re
+
     msg = await dispatch_task(
         goal=req.goal,
         repo=req.repo,
         mode=req.mode,
         harness=req.harness,
     )
-    return {"ok": True, "message": msg}
+    match = re.search(r"Started\s+(task-\S+)", msg)
+    task_id = match.group(1) if match else None
+    return {"ok": True, "task_id": task_id, "message": msg}
 
 
 @router.post("/tasks/{task_id}/steer")
@@ -759,7 +948,84 @@ async def api_clear_tasks() -> dict[str, Any]:
 @router.post("/a2ui/dismiss")
 async def api_dismiss_surface(req: DismissSurfaceRequest) -> dict[str, Any]:
     _dismissed_surfaces.add(req.surface_id)
+    if req.surface_id.startswith("a2ui-"):
+        tid = req.surface_id.removeprefix("a2ui-").strip().lower()
+        reg = get_task_registry()
+        handle = reg._tasks.get(tid)
+        if handle is not None:
+            handle.dismissed = True
+        try:
+            from app.store.task_store import get_task_store
+            from app.tasks.persistence import is_store_active
+
+            if is_store_active():
+                await get_task_store().mark_task_dismissed(tid)
+        except Exception:
+            pass
     return {"ok": True}
+
+
+class CreateGoogleDocRequest(BaseModel):
+    title: str
+    content: str
+
+
+@router.post("/artifacts/google-doc")
+async def api_create_google_doc_from_artifact(req: CreateGoogleDocRequest) -> dict[str, Any]:
+    """Uploads a sandbox artifact (.md/.txt) as a native Google Doc in the user's Google Drive."""
+    import json
+
+    from app.app_utils.http_client import get_http_client
+    from app.auth import ensure_fresh_access_token, get_workspace_headers
+
+    token = await ensure_fresh_access_token("google_workspace")
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google Workspace is not connected yet. Connect Google Workspace in the Configuration sheet.",
+        )
+
+    boundary = "===adk_sonar_doc_boundary==="
+    metadata = {
+        "name": req.title.strip() or "ADK Sonar Artifact",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    body = (
+        f"--{boundary}\r\n"
+        "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{json.dumps(metadata)}\r\n"
+        f"--{boundary}\r\n"
+        "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
+        f"{req.content}\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+
+    headers = {
+        **get_workspace_headers(token),
+        "Content-Type": f"multipart/related; boundary={boundary}",
+    }
+    async with get_http_client(timeout=15.0) as client:
+        r = await client.post(
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
+            content=body,
+            headers=headers,
+        )
+        if r.status_code not in {200, 201}:
+            raise HTTPException(
+                status_code=r.status_code,
+                detail=f"Google Drive upload failed ({r.status_code}): {r.text[:200]}",
+            )
+        data = r.json()
+        doc_id = data.get("id")
+        doc_url = data.get("webViewLink") or (
+            f"https://docs.google.com/document/d/{doc_id}/edit" if doc_id else ""
+        )
+        return {
+            "ok": True,
+            "id": doc_id,
+            "title": data.get("name") or req.title,
+            "url": doc_url,
+        }
 
 
 @router.patch("/integrations/{name}")

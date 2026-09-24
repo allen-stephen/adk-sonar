@@ -45,6 +45,8 @@ PLAN_SYSTEM_PROMPT_TEMPLATE = (
     "git worktree ({worktree_path}) on branch '{branch}' for workspace/repository '{repo}'.\n"
     "CURRENT PHASE: PHASE 1 — ITERATIVE PLANNING, RESEARCH & TRADE-OFF ANALYSIS (READ-ONLY).\n"
     "- Inspect the workspace files, codebase architecture, or primary research sources to design a concrete plan.\n"
+    "- When the goal involves creating or building a new AI agent project, ALWAYS plan around scaffolding it with "
+    "the pre-installed `agents-cli` (`agents-cli create <name> --adk --prototype -y` or `agents-cli scaffold create`).\n"
     "- Leverage your pre-installed Agent Skills (`agents-cli` skills, `brainstorming`, `writing-plans`, `research`, "
     "`grill-me`, `code-review`, `doc-coauthoring`, `agent-browser`, or `npx -y skills find <query>` via `find-skills`) "
     "and active GCP authentication (`$GOOGLE_CLOUD_PROJECT`) as needed.\n"
@@ -59,8 +61,11 @@ EXECUTE_SYSTEM_PROMPT_TEMPLATE = (
     "git worktree ({worktree_path}) on branch '{branch}' for workspace/repository '{repo}'.\n"
     "CURRENT PHASE: PHASE 2 — AUTONOMOUS UNATTENDED EXECUTION.\n"
     "- The user has reviewed and locked the plan and provided any final steering direction.\n"
-    "- Execute the implementation, research synthesis, document generation, evaluation (`agents-cli eval`), or approved deployment "
-    "(`agents-cli deploy` against `$GOOGLE_CLOUD_PROJECT`) end-to-end autonomously.\n"
+    "- When creating a new AI agent project, ALWAYS scaffold it using `agents-cli create <name> --adk --prototype -y --deployment-target none` "
+    "(or `agents-cli scaffold create --adk -p -y`) rather than writing boilerplate from scratch, then implement the requested domain tools and unit tests.\n"
+    "- For software engineering tasks, write or update unit tests and run `pytest` to verify your changes before finishing.\n"
+    "- For generalist, research, or planning deliverables (such as menus, shopping lists, or briefs), save the deliverable as a Markdown file "
+    "in the workspace AND include the complete deliverable summary in your final response so the voice orchestrator can narrate it or email it directly.\n"
     "- Leverage pre-installed Agent Skills (`executing-plans`, `test-driven-development`, `systematic-debugging`, "
     "`verification-before-completion`, `doc-coauthoring`, `pdf`/`docx`/`xlsx`/`pptx`) to verify your work and produce "
     "a clear summary of all changes applied or deliverables created."
@@ -132,43 +137,74 @@ def build_cross_harness_handoff(
     )
 
 
-def extract_plan_from_json_output(
-    raw_stdout: str,
-    *,
-    fallback_session_id: str,
-    goal: str,
-    repo: str,
-    display_name: str,
-) -> tuple[str, str, list[str], list[str]]:
-    """Extract `(session_id, plan_summary, questions, files_to_modify)` from Claude or Antigravity JSON output.
+def _extract_last_json_dict(raw_stdout: str) -> dict[str, Any]:
+    """Extract the terminal JSON dictionary from single-line NDJSON, multi-line JSON, or ```json fences."""
+    import re
 
-    Supports:
-    - Claude Code JSON envelope (`session_id`, `structured_output`, `result`)
-    - Antigravity JSON envelope (`conversation_id`, `structured_output`, `response`)
-    - Streaming NDJSON where the terminal line is a `result` object
-    """
-    default_summary = f"Proposed plan from {display_name} for {goal} in {repo}."
-    default_questions = [
-        f"Should the implementation for '{goal}' in {repo} include automated unit tests?",
-        "Do you prefer a standalone module or integrating into existing utilities?",
-    ]
+    stripped = (raw_stdout or "").strip()
+    if not stripped:
+        return {}
 
-    if not raw_stdout or not raw_stdout.strip():
-        return fallback_session_id, default_summary, default_questions, []
-
-    lines = [line.strip() for line in raw_stdout.strip().splitlines() if line.strip()]
-    payload: dict[str, Any] = {}
+    # 1. Fast path: single-line NDJSON (Claude Code / Antigravity stream-json or json)
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
     for line in reversed(lines):
         try:
             candidate = json.loads(line)
             if isinstance(candidate, dict):
-                payload = candidate
-                break
+                return candidate
         except json.JSONDecodeError:
             continue
 
+    # 2. Fenced ```json ... ``` block or raw multi-line JSON object (Horizon A2A)
+    fence_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
+    for block in reversed(fence_matches):
+        try:
+            candidate = json.loads(block)
+            if isinstance(candidate, dict):
+                return candidate
+        except json.JSONDecodeError:
+            continue
+
+    try:
+        candidate = json.loads(stripped)
+        if isinstance(candidate, dict):
+            return candidate
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Last-resort brace slice for prose followed by a multi-line JSON object
+    first_brace = stripped.find("{")
+    last_brace = stripped.rfind("}")
+    if 0 <= first_brace < last_brace:
+        try:
+            candidate = json.loads(stripped[first_brace : last_brace + 1])
+            if isinstance(candidate, dict):
+                return candidate
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
+def extract_plan_from_json_output(
+    raw_stdout: str,
+    *,
+    fallback_session_id: str,
+) -> tuple[str, str, list[str], list[str]] | None:
+    """Extract `(session_id, plan_summary, questions, files_to_modify)` from Claude, Antigravity, or Horizon JSON output.
+
+    Supports:
+    - Claude Code JSON envelope (`session_id`, `structured_output`, `result`)
+    - Antigravity JSON envelope (`conversation_id`, `structured_output`, `response`)
+    - Horizon A2A top-level `PLAN_OUTPUT_SCHEMA` JSON (including ```json fenced blocks)
+    - Streaming NDJSON where the terminal line is a `result` object
+
+    Returns `None` when the harness produced nothing usable (empty stdout, no JSON
+    object, or a JSON object carrying neither `structured_output` nor response text).
+    """
+    payload = _extract_last_json_dict(raw_stdout)
     if not payload:
-        return fallback_session_id, default_summary, default_questions, []
+        return None
 
     # Unwrap Antigravity stream-json `{"event": "result", "result": {...}}` envelope if present
     inner = (
@@ -187,23 +223,23 @@ def extract_plan_from_json_output(
 
     structured = inner.get("structured_output")
     if not isinstance(structured, dict):
-        # Also check if `response` or `result` is itself a serialized JSON string matching PLAN_OUTPUT_SCHEMA
-        raw_resp = inner.get("response") or inner.get("result")
-        if isinstance(raw_resp, str):
-            try:
-                parsed_resp = json.loads(raw_resp)
-                if isinstance(parsed_resp, dict):
-                    structured = parsed_resp
-            except json.JSONDecodeError:
-                pass
+        # Check if `inner` itself is a top-level PLAN_OUTPUT_SCHEMA object (Horizon A2A)
+        if "plan_summary" in inner or "steps" in inner:
+            structured = inner
+        else:
+            # Also check if `response` or `result` is itself a serialized JSON string matching PLAN_OUTPUT_SCHEMA
+            raw_resp = inner.get("response") or inner.get("result")
+            if isinstance(raw_resp, str):
+                nested = _extract_last_json_dict(raw_resp)
+                if nested and ("plan_summary" in nested or "steps" in nested):
+                    structured = nested
 
     if isinstance(structured, dict):
-        plan_summary = str(structured.get("plan_summary") or default_summary)
         raw_questions = structured.get("questions")
         questions = (
             [str(q) for q in raw_questions if q]
-            if isinstance(raw_questions, list) and raw_questions
-            else default_questions
+            if isinstance(raw_questions, list)
+            else []
         )
         raw_files = structured.get("files_to_modify")
         files = (
@@ -211,43 +247,45 @@ def extract_plan_from_json_output(
             if isinstance(raw_files, list)
             else []
         )
+        plan_summary = str(
+            structured.get("plan_summary")
+            or inner.get("response")
+            or inner.get("result")
+            or ""
+        ).strip()
+        if not plan_summary and not questions and not files:
+            return None
         return str(session_id), plan_summary, questions, files
 
-    text_summary = str(
-        inner.get("response") or inner.get("result") or default_summary
-    ).strip()
-    return str(session_id), text_summary or default_summary, default_questions, []
+    text_summary = str(inner.get("response") or inner.get("result") or "").strip()
+    if not text_summary:
+        return None
+    return str(session_id), text_summary, [], []
 
 
 def extract_plan_steps_from_json_output(raw_stdout: str) -> list[str]:
     """Extract the ordered `steps` array from a harness JSON planning output envelope."""
-    if not raw_stdout or not raw_stdout.strip():
+    payload = _extract_last_json_dict(raw_stdout)
+    if not payload:
         return []
-    for line in reversed([ln.strip() for ln in raw_stdout.strip().splitlines() if ln.strip()]):
-        try:
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                continue
-            inner = (
-                payload.get("result")
-                if payload.get("event") == "result" and isinstance(payload.get("result"), dict)
-                else payload
-            )
-            structured = inner.get("structured_output")
-            if not isinstance(structured, dict):
-                raw_resp = inner.get("response") or inner.get("result")
-                if isinstance(raw_resp, str):
-                    try:
-                        parsed_resp = json.loads(raw_resp)
-                        if isinstance(parsed_resp, dict):
-                            structured = parsed_resp
-                    except json.JSONDecodeError:
-                        pass
-            if isinstance(structured, dict):
-                raw_steps = structured.get("steps")
-                if isinstance(raw_steps, list):
-                    return [str(s).strip() for s in raw_steps if str(s).strip()]
-            break
-        except json.JSONDecodeError:
-            continue
+    inner = (
+        payload.get("result")
+        if payload.get("event") == "result" and isinstance(payload.get("result"), dict)
+        else payload
+    )
+    structured = inner.get("structured_output")
+    if not isinstance(structured, dict):
+        if "steps" in inner or "plan_summary" in inner:
+            structured = inner
+        else:
+            raw_resp = inner.get("response") or inner.get("result")
+            if isinstance(raw_resp, str):
+                nested = _extract_last_json_dict(raw_resp)
+                if nested:
+                    structured = nested
+    if isinstance(structured, dict):
+        raw_steps = structured.get("steps")
+        if isinstance(raw_steps, list):
+            return [str(s).strip() for s in raw_steps if str(s).strip()]
     return []
+

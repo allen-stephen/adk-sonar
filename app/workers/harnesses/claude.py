@@ -153,14 +153,37 @@ class ClaudeCodeHarness:
     def build_env(self) -> dict[str, str]:
         from app.auth import get_sandbox_gcp_env
 
-        return {
-            **get_sandbox_gcp_env(),
+        gcp_env = get_sandbox_gcp_env()
+        project_id = (
+            gcp_env.get("ANTHROPIC_VERTEX_PROJECT_ID")
+            or gcp_env.get("GOOGLE_CLOUD_PROJECT")
+            or os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "")
+            or os.getenv("GOOGLE_CLOUD_PROJECT", "")
+        )
+        default_sonnet = os.getenv(
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        )
+        default_haiku = os.getenv(
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            os.getenv("ANTHROPIC_SMALL_FAST_MODEL", "claude-haiku-4-5@20251001"),
+        )
+        env = {
+            **gcp_env,
             "CLAUDE_CODE_USE_VERTEX": os.getenv("CLAUDE_CODE_USE_VERTEX", "1"),
-            "ANTHROPIC_VERTEX_PROJECT_ID": os.getenv(
-                "ANTHROPIC_VERTEX_PROJECT_ID",
-                os.getenv("GOOGLE_CLOUD_PROJECT", ""),
-            ),
+            "CLOUD_ML_REGION": os.getenv("CLOUD_ML_REGION", "global"),
+            "ANTHROPIC_VERTEX_PROJECT_ID": project_id,
+            "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", default_sonnet),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": default_sonnet,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": default_haiku,
         }
+        if os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"):
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+        if os.getenv("VERTEX_REGION_CLAUDE_HAIKU_4_5"):
+            env["VERTEX_REGION_CLAUDE_HAIKU_4_5"] = os.environ["VERTEX_REGION_CLAUDE_HAIKU_4_5"]
+        if os.getenv("VERTEX_REGION_CLAUDE_4_6_SONNET"):
+            env["VERTEX_REGION_CLAUDE_4_6_SONNET"] = os.environ["VERTEX_REGION_CLAUDE_4_6_SONNET"]
+        return env
 
     def build_provision_commands(self, profile: Any | None = None) -> list[str]:
         from app.workers.harnesses.provisioner import get_default_provision_recipe
@@ -183,6 +206,8 @@ class ClaudeCodeHarness:
         on_event: Callable[[HarnessEvent], None] | None = None,
     ) -> WorkerExecutionResult:
         """Run headless Claude Code inside the provisioned Vertex Sandbox via `/exec`."""
+        from app.auth import get_local_adc_json_for_sandbox
+
         sess_id = session_id or f"claude-sess-{task_id}"
         branch = context.branch or f"agent/{task_id}"
         wt_path = str(context.worktree_dir or f"/workspace/.worktrees/{task_id}")
@@ -228,10 +253,43 @@ class ClaudeCodeHarness:
                 events=[message],
             )
 
+        run_env = self.build_env()
+        adc_json = get_local_adc_json_for_sandbox()
+        settings_payload = json.dumps(
+            {
+                "env": {
+                    k: v
+                    for k, v in run_env.items()
+                    if k.startswith(
+                        (
+                            "CLAUDE_",
+                            "ANTHROPIC_",
+                            "CLOUD_ML_",
+                            "VERTEX_REGION_",
+                            "GOOGLE_",
+                            "GH_",
+                            "GITHUB_",
+                        )
+                    )
+                }
+            },
+            separators=(",", ":"),
+        )
+        adc_setup_parts = [
+            'export PATH="/workspace/.sonar/audit_bin:/workspace/.sonar-venv/bin:$HOME/.local/bin:$PATH"',
+            f"mkdir -p /workspace/.sonar \"$HOME/.claude\"",
+            f"printf %s {shlex.quote(settings_payload)} > \"$HOME/.claude/settings.json\"",
+        ]
+        if adc_json:
+            adc_setup_parts.append(
+                f"printf %s {shlex.quote(adc_json)} > /workspace/.sonar/application_default_credentials.json"
+            )
+        adc_setup = " && ".join(adc_setup_parts) + " && "
+
         exec_result = await exec_in_sandbox(
             context,
-            f"mkdir -p {shlex.quote(wt_path)} && cd {shlex.quote(wt_path)} && {cmd}",
-            env=self.build_env(),
+            f"{adc_setup}mkdir -p {shlex.quote(wt_path)} && cd {shlex.quote(wt_path)} && {cmd}",
+            env=run_env,
             timeout_s=self.live_timeout_s,
         )
 
@@ -250,13 +308,17 @@ class ClaudeCodeHarness:
                 )
             from app.workers.harnesses.prompts import extract_plan_steps_from_json_output
 
-            parsed_sess, plan_summary, questions, _files = extract_plan_from_json_output(
+            parsed = extract_plan_from_json_output(
                 exec_result.stdout,
                 fallback_session_id=sess_id,
-                goal=goal,
-                repo=repo,
-                display_name=self.display_name,
             )
+            if parsed is None:
+                return _fail(
+                    f"{self.display_name} returned no parseable plan. "
+                    f"Raw output: {exec_result.stdout.strip()[:300] or '(empty)'}",
+                    1,
+                )
+            parsed_sess, plan_summary, questions, _files = parsed
             plan_steps = extract_plan_steps_from_json_output(exec_result.stdout)
             full_plan_text = (
                 f"{plan_summary} Steps: {'; '.join(plan_steps)}"
@@ -286,10 +348,27 @@ class ClaudeCodeHarness:
             )
 
         events_log: list[str] = []
+        completed_summary: str | None = None
+        last_prose_message: str | None = None
+        parsed_sess_id: str = sess_id
         for raw_line in exec_result.stdout.splitlines():
             ev = self.parse_stream_line(raw_line, task_id)
             if ev:
                 events_log.append(ev.message)
+                meta_sess = (ev.metadata or {}).get("session_id") or (
+                    ev.metadata or {}
+                ).get("conversation_id")
+                if isinstance(meta_sess, str) and meta_sess.strip():
+                    parsed_sess_id = meta_sess.strip()
+                if ev.kind == "completed" and ev.message.strip():
+                    completed_summary = ev.message.strip()
+                elif (
+                    ev.kind == "progress"
+                    and ev.message.strip()
+                    and not ev.message.startswith("Running ")
+                    and not ev.message.startswith("Initialized ")
+                ):
+                    last_prose_message = ev.message.strip()
                 if on_event:
                     on_event(ev)
 
@@ -300,11 +379,15 @@ class ClaudeCodeHarness:
                 exec_result.exit_code,
             )
 
+        from app.workers.harnesses.base import collect_worktree_artifacts
+
         changed, diff_sum, raw_diff = await collect_worktree_changes(wt_path, context=context)
+        artifacts = await collect_worktree_artifacts(wt_path, changed, context=context)
         summary = (
-            events_log[-1]
-            if events_log
-            else (
+            completed_summary
+            or last_prose_message
+            or (events_log[-1] if events_log else None)
+            or (
                 f"Task {task_id} completed by {self.display_name} in sandbox "
                 f"{context.sandbox_name.split('/')[-1]}."
             )
@@ -313,8 +396,9 @@ class ClaudeCodeHarness:
             exit_code=0,
             summary=summary,
             response_text=summary,
-            claude_session_id=sess_id,
+            claude_session_id=parsed_sess_id,
             files_changed=changed,
+            artifacts=artifacts,
             awaiting_approval=require_approval,
             diff_summary=diff_sum,
             raw_diff=raw_diff,

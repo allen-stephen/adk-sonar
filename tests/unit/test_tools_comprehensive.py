@@ -23,8 +23,6 @@ from app.agent import (
     search_web_grounded,
     set_coding_harness,
     steer_task,
-    stop_streaming,
-    watch_tasks,
 )
 from app.fast_api_app import app
 from app.integrations import (
@@ -113,7 +111,7 @@ async def test_task_tools_all_branches(
     )
 
     await dispatch_task(
-        goal="Plan feature", repo="r1", mode="plan", harness="fake_planner"
+        goal="Plan feature", repo="r1", mode="plan", harness="fake_planner", task_id="task-1"
     )
     await dispatch_task(
         goal="Code feature",
@@ -121,6 +119,7 @@ async def test_task_tools_all_branches(
         mode="execute",
         harness="fake_builder",
         require_approval=True,
+        task_id="task-2",
     )
 
     task_reg = get_task_registry()
@@ -138,17 +137,36 @@ async def test_task_tools_all_branches(
     assert "Awaiting your input" in tasks_summary
     assert "Awaiting your approval" in tasks_summary
 
-    # watch_tasks yielding awaiting_input and awaiting_approval notifications
-    watcher = watch_tasks()
-    msg1 = await asyncio.wait_for(watcher.__anext__(), timeout=2.0)
-    msg2 = await asyncio.wait_for(watcher.__anext__(), timeout=2.0)
-    await watcher.aclose()
-    combined = f"{msg1} | {msg2}"
-    assert "has questions" in combined
-    assert "ready for your approval" in combined.lower()
+    # Verify non_blocking_tool(dispatch_task) yields BOTH immediate kickoff ack AND task completion
+    from app.agent import non_blocking_tool
+    from app.tools.task_tools import format_task_completion_for_voice
 
-    # stop_streaming
-    assert "Stopped streaming" in await stop_streaming("watch_tasks")
+    msg1 = format_task_completion_for_voice(h1)
+    msg2 = format_task_completion_for_voice(h2)
+    assert "Questions for you" in msg1
+    assert "ready for review" in msg2.lower()
+
+    from google.genai import types
+
+    wrapped_dispatch = non_blocking_tool(dispatch_task)
+    chunks = [
+        chunk
+        async for chunk in wrapped_dispatch.func(
+            goal="Plan second feature",
+            repo="r1",
+            mode="plan",
+            harness="fake_planner",
+            task_id="task-3",
+        )
+    ]
+    assert len(chunks) == 2
+    assert isinstance(chunks[0], types.FunctionResponse)
+    assert chunks[0].scheduling == types.FunctionResponseScheduling.SILENT
+    assert chunks[0].response["result"].startswith("Started task-3")
+    assert isinstance(chunks[1], types.FunctionResponse)
+    assert chunks[1].scheduling == types.FunctionResponseScheduling.WHEN_IDLE
+    assert "finished planning" in chunks[1].response["result"]
+    assert "Should the feature be behind a flag?" in chunks[1].response["result"]
 
 
 @pytest.mark.asyncio
@@ -161,10 +179,12 @@ async def test_grounding_and_integration_tools(monkeypatch: pytest.MonkeyPatch):
 
     assert GROUNDING_MODEL == "gemini-3.8-flash"
 
-    # Verify specialist & harness tools on root_agent have FunctionResponseScheduling.WHEN_IDLE (Behavior.NON_BLOCKING)
+    # Verify specialist & harness tools on root_agent have FunctionResponseScheduling.SILENT on the
+    # initial ADK 'pending' placeholder (so the model never repeats its kickoff sentence twice),
+    # while yielding FunctionResponseScheduling.WHEN_IDLE on actual completion.
     tool_map = {getattr(t, "name", getattr(t, "__name__", "")): t for t in root_agent.tools}
     for nb_name in ("search_web_grounded", "search_maps_grounded", "dispatch_task", "steer_task", "approve_task"):
-        assert tool_map[nb_name].response_scheduling == types.FunctionResponseScheduling.WHEN_IDLE
+        assert tool_map[nb_name].response_scheduling == types.FunctionResponseScheduling.SILENT
 
     # Toggle google_search off -> returns disabled message
     await configure_integration("google_search", False)
@@ -291,7 +311,7 @@ def test_api_routes_control_plane_endpoints(
     )
     assert create_res.status_code == 200
     assert create_res.json()["ok"] is True
-    tid = "task-1"
+    tid = create_res.json().get("task_id") or "task-1"
 
     steer_res = client.post(
         f"/api/v1/tasks/{tid}/steer",

@@ -193,9 +193,7 @@ export function FleetTasksSheet({
                         }}
                       >
                         <HarnessBrandIcon name={task.harness} size={17} />
-                        <span>
-                          {task.task_id} · {task.repo}
-                        </span>
+                        <span>{task.repo || "Workspace"}</span>
                       </div>
 
                       <span
@@ -315,7 +313,7 @@ export function FleetTasksSheet({
                         </button>
                       )}
 
-                      {task.status === "running" && onCancelTask && (
+                      {(task.status === "running" || isAwaiting) && onCancelTask && (
                         <button
                           type="button"
                           className="small-action-btn"
@@ -326,7 +324,7 @@ export function FleetTasksSheet({
                           }}
                           onClick={() => onCancelTask(task.task_id)}
                         >
-                          Cancel Run
+                          Cancel
                         </button>
                       )}
 
@@ -477,9 +475,7 @@ export function FleetTasksSheet({
                             }}
                           >
                             <HarnessBrandIcon name={t.harness} size={14} />
-                            <span>
-                              {t.task_id} · {t.repo}
-                            </span>
+                            <span>{t.repo || "Workspace"}</span>
                             {t.branch && (
                               <span
                                 style={{

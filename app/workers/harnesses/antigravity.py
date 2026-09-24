@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -85,12 +86,21 @@ class AntigravityHarness:
             "-p",
             prompt_with_instructions,
         ]
+        # Opt-in model pinning. Without this the CLI picks its own default, which
+        # makes A/B results unattributable to a model. Run `agy models` for valid
+        # names. Unset leaves the CLI default in place.
+        agy_model = os.getenv("ANTIGRAVITY_MODEL", "").strip()
+        if agy_model:
+            cmd.extend(["--model", agy_model])
         if session_id:
             cmd.extend(["--conversation", session_id])
 
         if mode == "plan":
             cmd.extend(
                 [
+                    "--mode",
+                    "plan",
+                    "--dangerously-skip-permissions",
                     "--output-format",
                     "json",
                     "--json-schema",
@@ -133,12 +143,22 @@ class AntigravityHarness:
     def build_env(self) -> dict[str, str]:
         from app.auth import get_sandbox_gcp_env
 
-        return {
-            **get_sandbox_gcp_env(),
+        gcp_env = get_sandbox_gcp_env()
+        gemini_key = (
+            gcp_env.get("GEMINI_API_KEY")
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+            or ""
+        ).strip()
+        env = {
+            **gcp_env,
             "GOOGLE_GENAI_USE_VERTEXAI": os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE"),
-            "GOOGLE_CLOUD_PROJECT": os.getenv("GOOGLE_CLOUD_PROJECT", ""),
-            "GOOGLE_CLOUD_LOCATION": os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+            "GOOGLE_CLOUD_PROJECT": gcp_env.get("GOOGLE_CLOUD_PROJECT", ""),
+            "GOOGLE_CLOUD_LOCATION": gcp_env.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
         }
+        if gemini_key:
+            env["GEMINI_API_KEY"] = gemini_key
+        return env
 
     def build_provision_commands(self, profile: Any | None = None) -> list[str]:
         from app.workers.harnesses.provisioner import get_default_provision_recipe
@@ -208,10 +228,33 @@ class AntigravityHarness:
                 events=[message],
             )
 
+        from app.auth import get_local_adc_json_for_sandbox
+
+        run_env = self.build_env()
+        adc_json = get_local_adc_json_for_sandbox()
+        setup_parts: list[str] = [
+            'export PATH="/workspace/.sonar/audit_bin:/workspace/.sonar-venv/bin:$HOME/.local/bin:$PATH"'
+        ]
+        if run_env.get("GEMINI_API_KEY"):
+            agy_settings = json.dumps({"modelProvider": "gemini"}, separators=(",", ":"))
+            setup_parts.append(
+                f'mkdir -p "$HOME/.gemini/antigravity-cli" && '
+                f'printf %s {shlex.quote(agy_settings)} > "$HOME/.gemini/antigravity-cli/settings.json"'
+            )
+        if adc_json:
+            setup_parts.append(
+                f"mkdir -p /workspace/.sonar && printf %s {shlex.quote(adc_json)} > /workspace/.sonar/application_default_credentials.json"
+            )
+        if run_env.get("GH_TOKEN"):
+            quoted_gh = shlex.quote(run_env["GH_TOKEN"])
+            setup_parts.append(
+                f"export GH_TOKEN={quoted_gh} GITHUB_PERSONAL_ACCESS_TOKEN={quoted_gh}"
+            )
+        setup_prefix = " && ".join(setup_parts) + " && "
         exec_result = await exec_in_sandbox(
             context,
-            f"mkdir -p {shlex.quote(wt_path)} && cd {shlex.quote(wt_path)} && {cmd}",
-            env=self.build_env(),
+            f"{setup_prefix}mkdir -p {shlex.quote(wt_path)} && cd {shlex.quote(wt_path)} && {cmd}",
+            env=run_env,
             timeout_s=self.live_timeout_s,
         )
 
@@ -230,13 +273,17 @@ class AntigravityHarness:
                 )
             from app.workers.harnesses.prompts import extract_plan_steps_from_json_output
 
-            parsed_sess, plan_summary, questions, _files = extract_plan_from_json_output(
+            parsed = extract_plan_from_json_output(
                 exec_result.stdout,
                 fallback_session_id=sess_id,
-                goal=goal,
-                repo=repo,
-                display_name=self.display_name,
             )
+            if parsed is None:
+                return _fail(
+                    f"{self.display_name} returned no parseable plan. "
+                    f"Raw output: {exec_result.stdout.strip()[:300] or '(empty)'}",
+                    1,
+                )
+            parsed_sess, plan_summary, questions, _files = parsed
             plan_steps = extract_plan_steps_from_json_output(exec_result.stdout)
             full_plan_text = (
                 f"{plan_summary} Steps: {'; '.join(plan_steps)}"
@@ -266,10 +313,27 @@ class AntigravityHarness:
             )
 
         events_log: list[str] = []
+        completed_summary: str | None = None
+        last_prose_message: str | None = None
+        parsed_sess_id: str = sess_id
         for raw_line in exec_result.stdout.splitlines():
             ev = self.parse_stream_line(raw_line, task_id)
             if ev:
                 events_log.append(ev.message)
+                meta_sess = (ev.metadata or {}).get("session_id") or (
+                    ev.metadata or {}
+                ).get("conversation_id")
+                if isinstance(meta_sess, str) and meta_sess.strip():
+                    parsed_sess_id = meta_sess.strip()
+                if ev.kind == "completed" and ev.message.strip():
+                    completed_summary = ev.message.strip()
+                elif (
+                    ev.kind == "progress"
+                    and ev.message.strip()
+                    and not ev.message.startswith("Running ")
+                    and not ev.message.startswith("Initialized ")
+                ):
+                    last_prose_message = ev.message.strip()
                 if on_event:
                     on_event(ev)
 
@@ -280,11 +344,15 @@ class AntigravityHarness:
                 exec_result.exit_code,
             )
 
+        from app.workers.harnesses.base import collect_worktree_artifacts
+
         changed, diff_sum, raw_diff = await collect_worktree_changes(wt_path, context=context)
+        artifacts = await collect_worktree_artifacts(wt_path, changed, context=context)
         summary = (
-            events_log[-1]
-            if events_log
-            else (
+            completed_summary
+            or last_prose_message
+            or (events_log[-1] if events_log else None)
+            or (
                 f"Task {task_id} completed by {self.display_name} in sandbox "
                 f"{context.sandbox_name.split('/')[-1]}."
             )
@@ -293,8 +361,9 @@ class AntigravityHarness:
             exit_code=0,
             summary=summary,
             response_text=summary,
-            claude_session_id=sess_id,
+            claude_session_id=parsed_sess_id,
             files_changed=changed,
+            artifacts=artifacts,
             awaiting_approval=require_approval,
             diff_summary=diff_sum,
             raw_diff=raw_diff,

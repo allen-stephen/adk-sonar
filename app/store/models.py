@@ -43,6 +43,7 @@ class TaskRecord(Base):
     worktree_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default="queued")
     require_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    dismissed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     current_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -100,6 +101,7 @@ class TaskRecord(Base):
             async_task=None,
             harness=self.harness or "claude",
             mode=self.mode or "execute",
+            require_approval=bool(self.require_approval),
             branch=self.branch,
             worktree_path=self.worktree_path,
             exit_code=self.exit_code,
@@ -116,6 +118,8 @@ class TaskRecord(Base):
             pending_action=self.pending_action,
             created_at_ts=created_ts,
             ended_at_ts=ended_ts,
+            from_history=True,
+            dismissed=bool(self.dismissed),
             latest_update=events[-1] if events else self.summary,
             events=events,
             _status=self.status,
@@ -134,6 +138,7 @@ class TaskRecord(Base):
             "worktree_path": self.worktree_path,
             "status": self.status,
             "require_approval": self.require_approval,
+            "dismissed": bool(self.dismissed),
             "current_run_id": self.current_run_id,
             "summary": self.summary,
             "response_text": self.response_text,

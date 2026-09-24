@@ -251,6 +251,7 @@ export function App() {
                   : state.default_harness.display_name
               }
               onApprovePlan={handleApprovePlan}
+              onCancelTask={(taskId) => actions.cancelTask.mutate(taskId)}
               onDismissSurface={(surfaceId) =>
                 actions.dismissSurface.mutate(surfaceId)
               }

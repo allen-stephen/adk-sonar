@@ -1,0 +1,95 @@
+{
+  "eval_case_id": "cuj_dev_greenfield_adk_agent",
+  "persona": "developer_greenfield",
+  "harness": "horizon",
+  "repo": "greenfield-agent",
+  "require_agents_cli": true,
+  "used_agents_cli": true,
+  "agents_cli_invocations": [
+    "--help",
+    "create --help",
+    "scaffold --help",
+    "create --help",
+    "--help",
+    "create --help",
+    "create --help",
+    "create --help",
+    "create release_blocker_agent -p -y -s"
+  ],
+  "adk_agent_detected": true,
+  "adk_evidence": "./release-blocker-agent/app/app_utils/a2a.py:37:from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor\n./release-blocker-agent/app/app_utils/a2a.py:38:from google.adk.a2a.utils.agent_card_builder import AgentCardBuilder\n./release-blocker-agent/app/app_utils/a2a.py:42:    from google.adk.agents import BaseAgent\n./release-blocker-agent/app/app_utils/a2a.py:43:    from google.adk.runners import Runner\n./release-blocker-agent/app/app_utils/services.py:27:from google.adk.artifacts import GcsArtifactService, InMemoryArtifactService\n./release-blocker-agent/app/app_utils/services.py:2",
+  "workspace_files": [
+    "README.md",
+    "release-blocker-agent/Dockerfile",
+    "release-blocker-agent/GEMINI.md",
+    "release-blocker-agent/README.md",
+    "release-blocker-agent/agents-cli-manifest.yaml",
+    "release-blocker-agent/app/__init__.py",
+    "release-blocker-agent/app/agent.py",
+    "release-blocker-agent/app/fast_api_app.py",
+    "release-blocker-agent/pyproject.toml"
+  ],
+  "wall_clock_s": 120.84,
+  "steps": [
+    {
+      "step_index": 0,
+      "harness": "horizon",
+      "mode": "plan",
+      "goal": "I want to create a new ADK agent project in this workspace using agents-cli that helps triage release blockers and summarize changelog notes. Inspect the available agents-cli scaffold options and propose a plan first without modifying files.",
+      "wall_clock_s": 44.19,
+      "exit_code": 0,
+      "summary": "```json\n{\n  \"plan_\nsummary\": \"Scaffold a new Python ADK agent project using `agents-cli create` with the `adk` template and implement\nspecialized tools and prompts for triaging release blockers and summarizing changelog notes.\",\n  \"steps\": [\n    \"Inspect\nthe available `agents-cli create` scaffolding templates and configuration options (Python `adk` template with prototype/Cloud\nRun/Agent Runtime deployment targets).\",\n    \"Run `agents-cli create release_blocker_agent -\na adk -p -y` (or chosen directory/scaffold settings) to generate the baseline ADK project structure without\nmodifying existing unrelated files.\",\n    \"Implement custom agent tools in the agent package for fetching/analyzing issue tracker blockers and\nparsing git commit/PR histories for changelog generation.\",\n    \"Configure the root agent instructions, prompt templates, and tool\nbindings in `agent.py` to specialize in release blocker categorization (severity/impact assessment) and structured changelog markdown synthesis.\",\n    \"\nAdd evaluation test cases and run `agents-cli eval run` or local unit tests to verify the agent's blocker\ntriage accuracy and changelog output formatting.\"\n  ],\n  \"questions\": [\n    \"What deployment target and session\nstorage backend do you prefer for this agent (e.g., `agent_runtime` vs `cloud_run`,\n`in_memory` vs `agent_platform_sessions`)?\",\n    \"Which issue tracker / source control integrations should the tools\nconnect to (e.g., GitHub API, GitLab API, Jira, or local git repository diffs)?\",\n\"Should the scaffolded agent live directly in the repository root or within a dedicated subfolder (e.g., `release_blocker_\nagent/`)?\"\n  ],\n  \"files_to_modify\": [\n    \"release_blocker_agent\n/agent.py\",\n    \"release_blocker_agent/pyproject.toml\",\n    \"release\n_blocker_agent/README.md\",\n    \"release_blocker_agent/eval_data.\njsonl\"\n  ]\n}\n```",
+      "response_text": "```json\n{\n  \"plan_\nsummary\": \"Scaffold a new Python ADK agent project using `agents-cli create` with the `adk` template and implement\nspecialized tools and prompts for triaging release blockers and summarizing changelog notes.\",\n  \"steps\": [\n    \"Inspect\nthe available `agents-cli create` scaffolding templates and configuration options (Python `adk` template with prototype/Cloud\nRun/Agent Runtime deployment targets).\",\n    \"Run `agents-cli create release_blocker_agent -\na adk -p -y` (or chosen directory/scaffold settings) to generate the baseline ADK project structure without\nmodifying existing unrelated files.\",\n    \"Implement custom agent tools in the agent package for fetching/analyzing issue tracker blockers and\nparsing git commit/PR histories for changelog generation.\",\n    \"Configure the root agent instructions, prompt templates, and tool\nbindings in `agent.py` to specialize in release blocker categorization (severity/impact assessment) and structured changelog markdown synthesis.\",\n    \"\nAdd evaluation test cases and run `agents-cli eval run` or local unit tests to verify the agent's blocker\ntriage accuracy and changelog output formatting.\"\n  ],\n  \"questions\": [\n    \"What deployment target and session\nstorage backend do you prefer for this agent (e.g., `agent_runtime` vs `cloud_run`,\n`in_memory` vs `agent_platform_sessions`)?\",\n    \"Which issue tracker / source control integrations should the tools\nconnect to (e.g., GitHub API, GitLab API, Jira, or local git repository diffs)?\",\n\"Should the scaffolded agent live directly in the repository root or within a dedicated subfolder (e.g., `release_blocker_\nagent/`)?\"\n  ],\n  \"files_to_modify\": [\n    \"release_blocker_agent\n/agent.py\",\n    \"release_blocker_agent/pyproject.toml\",\n    \"release\n_blocker_agent/README.md\",\n    \"release_blocker_agent/eval_data.\njsonl\"\n  ]\n}\n```",
+      "error": null,
+      "claude_session_id": "horizon-sess-eval-horizon-cuj_dev_greenfield_adk_agent-1790143941",
+      "files_changed": [],
+      "questions": [],
+      "diff_summary": null,
+      "raw_diff": null,
+      "events": [
+        "```json\n{\n  \"plan_\nsummary\": \"Scaffold a new Python ADK agent project using `agents-cli create` with the `adk` template and implement\nspecialized tools and prompts for triaging release blockers and summarizing changelog notes.\",\n  \"steps\": [\n    \"Inspect\nthe available `agents-cli create` scaffolding templates and configuration options (Python `adk` template with prototype/Cloud\nRun/Agent Runtime deployment targets).\",\n    \"Run `agents-cli create release_blocker_agent -\na adk -p -y` (or chosen directory/scaffold settings) to generate the baseline ADK project structure without\nmodifying existing unrelated files.\",\n    \"Implement custom agent tools in the agent package for fetching/analyzing issue tracker blockers and\nparsing git commit/PR histories for changelog generation.\",\n    \"Configure the root agent instructions, prompt templates, and tool\nbindings in `agent.py` to specialize in release blocker categorization (severity/impact assessment) and structured changelog markdown synthesis.\",\n    \"\nAdd evaluation test cases and run `agents-cli eval run` or local unit tests to verify the agent's blocker\ntriage accuracy and changelog output formatting.\"\n  ],\n  \"questions\": [\n    \"What deployment target and session\nstorage backend do you prefer for this agent (e.g., `agent_runtime` vs `cloud_run`,\n`in_memory` vs `agent_platform_sessions`)?\",\n    \"Which issue tracker / source control integrations should the tools\nconnect to (e.g., GitHub API, GitLab API, Jira, or local git repository diffs)?\",\n\"Should the scaffolded agent live directly in the repository root or within a dedicated subfolder (e.g., `release_blocker_\nagent/`)?\"\n  ],\n  \"files_to_modify\": [\n    \"release_blocker_agent\n/agent.py\",\n    \"release_blocker_agent/pyproject.toml\",\n    \"release\n_blocker_agent/README.md\",\n    \"release_blocker_agent/eval_data.\njsonl\"\n  ]\n}\n```"
+      ]
+    },
+    {
+      "step_index": 1,
+      "harness": "horizon",
+      "mode": "execute",
+      "goal": "Go ahead and scaffold/create the release-triage ADK agent project locally in this workspace using agents-cli, add a tool function for categorizing release blockers by severity, and keep everything local without deploying.",
+      "wall_clock_s": 76.65,
+      "exit_code": 1,
+      "summary": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+      "response_text": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+      "error": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+      "claude_session_id": "horizon-sess-eval-horizon-cuj_dev_greenfield_adk_agent-1790143941",
+      "files_changed": [],
+      "questions": [],
+      "diff_summary": null,
+      "raw_diff": null,
+      "events": [
+        "Connecting RemoteA2aAgent to ADK Long Horizon inside sandbox projects/947720812226/locations/us-central1/reasoningEngines/7694525857443872768/sandboxEnvironments/6332809293745618944 (X-Sandbox-Port: 8081, worktree=/workspace/.worktrees/eval-horizon-cuj_dev_greenfield_adk_agent-1790143941)",
+        "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox."
+      ]
+    }
+  ],
+  "exit_code": 1,
+  "summary": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+  "response_text": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+  "error": "ADK Long Horizon returned no response from https://dc5187be.a07637c6f.us-central1.sandbox.vertexai.goog/.well-known/agent-card.json. Verify the Horizon A2A server and agent card origin in the sandbox.",
+  "files_changed": [
+    "README.md",
+    "release-blocker-agent/Dockerfile",
+    "release-blocker-agent/GEMINI.md",
+    "release-blocker-agent/README.md",
+    "release-blocker-agent/agents-cli-manifest.yaml",
+    "release-blocker-agent/app/__init__.py",
+    "release-blocker-agent/app/agent.py",
+    "release-blocker-agent/app/fast_api_app.py",
+    "release-blocker-agent/pyproject.toml"
+  ],
+  "questions": [],
+  "diff_summary": null,
+  "raw_diff": null,
+  "pytest_exit_code": 2,
+  "pytest_stdout": "==================================== ERRORS ====================================\n____ ERROR collecting release-blocker-agent/tests/integration/test_agent.py ____\nImportError while importing test module '/workspace/.worktrees/eval-horizon-cuj_dev_greenfield_adk_agent-1790143941/release-blocker-agent/tests/integration/test_agent.py'.\nHint: make sure your test modules/packages have valid Python names.\nTraceback:\n/usr/local/lib/python3.12/importlib/__init__.py:90: in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nrelease-blocker-agent/tests/integration/test_agent.py:20: in <module>\n    from app.agent import root_agent\nE   ModuleNotFoundError: No module named 'app.agent'\n=========================== short test summary info ============================\nERROR release-blocker-agent/tests/integration/test_agent.py\n!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n1 error in 1.64s",
+  "reference": "In step 1 (plan mode), the harness must stay read-only and outline a plan to scaffold/build an ADK agent using `agents-cli` (`agents-cli scaffold create` or ADK `root_agent` structure). In step 2 (execute mode), the harness must use `agents-cli` / ADK conventions to create a local ADK agent defining `root_agent` with a release-blocker severity tool, with zero cloud deployment side effects."
+}

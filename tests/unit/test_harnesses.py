@@ -211,13 +211,14 @@ async def test_non_blocking_multi_harness_and_worktree_isolation(
     # Dispatch 3 concurrent agents on the SAME repository ('shared-api'):
     # two Claude Code instances + one ADK Long Horizon instance
     t0 = time.monotonic()
-    r1 = await dispatch_task(goal="Implement OAuth", repo="shared-api", harness="claude")
-    r2 = await dispatch_task(goal="Add rate limiter", repo="shared-api", harness="claude")
+    r1 = await dispatch_task(goal="Implement OAuth", repo="shared-api", harness="claude", task_id="task-1")
+    r2 = await dispatch_task(goal="Add rate limiter", repo="shared-api", harness="claude", task_id="task-2")
     r3 = await dispatch_task(
         goal="Optimize SQL queries",
         repo="shared-api",
         harness="horizon",
         require_approval=True,
+        task_id="task-3",
     )
     dispatch_elapsed = time.monotonic() - t0
 
@@ -366,10 +367,12 @@ def test_headless_2_phase_invocations_and_stream_json_parsing():
         worktree_path="/workspace/.worktrees/task-10",
         branch="agent/task-10",
     )
+    assert "--mode" in agy_plan_cmd
+    assert "plan" in agy_plan_cmd
+    assert "--dangerously-skip-permissions" in agy_plan_cmd
     assert "--output-format" in agy_plan_cmd
     assert "json" in agy_plan_cmd
     assert "--json-schema" in agy_plan_cmd
-    assert "--dangerously-skip-permissions" not in agy_plan_cmd
 
     # 2. Phase 2 (mode='execute') resumes captured session/conversation ID and enables unattended permissions
     claude_exec_cmd = claude.build_headless_invocation(
@@ -409,17 +412,39 @@ def test_headless_2_phase_invocations_and_stream_json_parsing():
             },
         }
     )
-    sess_id, summary, questions, files = extract_plan_from_json_output(
+    parsed = extract_plan_from_json_output(
         agy_json_envelope,
         fallback_session_id="fallback-id",
-        goal="Add Redis",
-        repo="auth-svc",
-        display_name="Antigravity",
     )
+    assert parsed is not None
+    sess_id, summary, questions, files = parsed
     assert sess_id == "4e502687-290c-4030-b908-5ed6c68fa5dc"
     assert summary == "Introduce RedisTokenStore with rotating JTIs."
     assert questions == ["Should TTL default to 15 minutes or 1 hour?"]
     assert files == ["src/auth/jwt.py"]
+
+    # 3b. Unusable harness output must report failure, never invent a plan.
+    for unusable in ("", "   ", "not json at all", "Traceback (most recent call last):"):
+        assert (
+            extract_plan_from_json_output(unusable, fallback_session_id="fallback-id")
+            is None
+        ), f"expected None for unusable stdout {unusable!r}"
+
+    # A valid envelope with no questions must report zero questions, not defaults.
+    no_questions = json.dumps(
+        {
+            "session_id": "sess-1",
+            "structured_output": {
+                "plan_summary": "Rename the module.",
+                "steps": ["Rename"],
+            },
+        }
+    )
+    parsed_nq = extract_plan_from_json_output(
+        no_questions, fallback_session_id="fallback-id"
+    )
+    assert parsed_nq is not None
+    assert parsed_nq[2] == []
 
     # 4. Parse real Antigravity (`event`) and Claude (`type`) stream-json lines
     agy_tool_line = json.dumps(
@@ -502,6 +527,7 @@ async def test_declarative_sandbox_seeding_and_cross_harness_worktree_transition
         repo="auth-svc",
         mode="plan",
         harness="claude",
+        task_id="task-1",
     )
     task_reg = get_task_registry()
     h1 = await task_reg.get("task-1")
@@ -656,7 +682,7 @@ async def test_sandbox_skills_gcp_auth_and_iterative_plan_steering(
             http_transport=sandbox_transport(exec_exit_code=0),
         ),
     )
-    await dispatch_task(goal="Design session store", repo="auth-svc", mode="plan", harness="claude")
+    await dispatch_task(goal="Design session store", repo="auth-svc", mode="plan", harness="claude", task_id="task-1")
     h = await get_task_registry().get("task-1")
     assert h is not None
     await h.async_task
@@ -672,6 +698,34 @@ async def test_sandbox_skills_gcp_auth_and_iterative_plan_steering(
     await h.async_task
     assert h.status == "awaiting_input"
     assert h.mode == "plan"
+
+
+def test_github_token_propagated_across_all_three_harnesses(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify GH_TOKEN and GITHUB_PERSONAL_ACCESS_TOKEN are propagated across Claude, Antigravity, and Horizon harnesses."""
+    from app.tools.integration_tools import _resolve_github_owner_and_repo
+    from app.workers.harnesses import (
+        AntigravityHarness,
+        ClaudeCodeHarness,
+        HorizonA2AHarness,
+    )
+
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_test_token_all_3")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    for harness in (ClaudeCodeHarness(), AntigravityHarness(), HorizonA2AHarness()):
+        env = harness.build_env()
+        assert env.get("GH_TOKEN") == "ghp_test_token_all_3"
+        assert env.get("GITHUB_PERSONAL_ACCESS_TOKEN") == "ghp_test_token_all_3"
+
+    short_name, fork_slug, upstream_slug = _resolve_github_owner_and_repo(
+        "agents-cli", "demo-user"
+    )
+    assert short_name == "agents-cli"
+    assert fork_slug == "demo-user/agents-cli"
+    assert upstream_slug == "google/agents-cli"
+
 
 
 

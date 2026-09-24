@@ -72,11 +72,24 @@ async def reconcile_once(
                     exit_code=exit_code,
                     ended=True,
                 )
-                await store.update_task_status(
+                task_rec = await store.update_task_status(
                     run.task_id,
                     status="completed" if state == "completed" else state,
                     ended=True,
                 )
+                if state in ("completed", "failed"):
+                    await store.record_event(
+                        task_id=run.task_id,
+                        run_id=run.id,
+                        kind="completed" if state == "completed" else "error",
+                        message=(task_rec.summary if task_rec and task_rec.summary else f"Task {state} in sandbox."),
+                        metadata={
+                            "short_id": task_rec.short_id if task_rec else run.task_id,
+                            "repo": task_rec.repo if task_rec else "current",
+                            "harness": run.harness,
+                            "status": state,
+                        },
+                    )
 
             reconciled_count += 1
         except Exception as exc:

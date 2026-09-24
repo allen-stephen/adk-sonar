@@ -100,6 +100,18 @@ custom_metrics:
           if "Traceback (most recent call last)" in text or "site-packages/" in text:
               violations.append("read raw stack trace aloud instead of compressing")
 
+          case_id = instance.get("eval_case_id", "")
+          lower_text = text.lower()
+          if case_id == "casual_greeting_persona":
+              for banned in (
+                  "workspace or coding",
+                  "coding tasks today",
+                  "engineering and workspace orchestrator",
+                  "how may i assist",
+              ):
+                  if banned in lower_text:
+                      violations.append(f"used robotic greeting cliché: '{banned}'")
+
           score = 1.0 if (text.strip() and not violations) else 0.0
           explanation = "Clean compressed spoken output across all turns" if score == 1.0 else f"Violations: {', '.join(violations) or 'empty response'}"
           return {"score": score, "explanation": explanation}
@@ -121,6 +133,12 @@ custom_metrics:
                       fc = part.get("function_call")
                       if isinstance(fc, dict) and fc.get("name"):
                           called_tools.append(fc["name"])
+
+          if case_id == "casual_greeting_persona":
+              return {
+                  "score": 1.0,
+                  "explanation": f"Casual greeting handled naturally (tools called: {called_tools})",
+              }
 
           required_all_map = {
               "plan_question_and_steer": ["dispatch_task", "get_task_result", "steer_task"],

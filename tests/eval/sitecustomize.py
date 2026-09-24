@@ -1,12 +1,14 @@
 """Evaluation-only startup hook loaded via `PYTHONPATH=tests/eval:.` during `make eval`.
 
-Wires the test doubles from `tests/fakes.py` into the `agents-cli eval run --mode adk_live`
-server subprocess so that `app/` remains 100% free of test/eval branches or canned strings
-while multi-turn voice evaluations execute deterministically.
+Wires the test doubles from `tests/fakes.py` (or recorded L1 sandbox fixtures from
+`tests/eval/fixtures/<harness>/*.json` when `EVAL_REPLAY_FIXTURES=1`) into the
+`agents-cli eval run --mode adk_live` server subprocess so that `app/` remains 100%
+free of test/eval branches while multi-turn voice evaluations execute deterministically.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -15,6 +17,22 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+
+def _load_recorded_fixture(harness_name: str) -> dict | None:
+    """Return the most recently recorded L1 sandbox fixture for `harness_name`, if enabled."""
+    if os.getenv("EVAL_REPLAY_FIXTURES", "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    fixture_dir = ROOT_DIR / "tests" / "eval" / "fixtures" / harness_name
+    if not fixture_dir.exists():
+        return None
+    candidates = sorted(fixture_dir.glob("*.json"))
+    if not candidates:
+        return None
+    try:
+        return json.loads(candidates[0].read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def _install_eval_harness_and_integration_fakes() -> None:
@@ -70,23 +88,43 @@ def _install_eval_harness_and_integration_fakes() -> None:
 
         grounding_mod._run_specialist = _eval_specialist
 
-        # 3. Deterministic coding harnesses & sandbox worker for coding CUJs
+        # 3. Coding harnesses: replay recorded L1 sandbox fixtures when EVAL_REPLAY_FIXTURES=1,
+        #    otherwise use deterministic FakeHarness baseline.
         reg = get_harness_registry()
         for h_name, disp in (
             ("claude", "Claude Code"),
             ("horizon", "ADK Long Horizon"),
             ("antigravity", "Antigravity"),
         ):
-            fake_h = FakeHarness(
-                name=h_name,
-                display_name=disp,
-                summary=f"Implemented requested changes via {disp} and verified all unit tests pass.",
-                questions=[
-                    "Should we use Redis-backed token rotation or in-memory caching?"
-                ],
-                writes={"src/module.py": "def execute() -> bool:\n    return True\n"},
-                diff_summary="1 file changed (+2 -0) in worktree.",
-            )
+            rec = _load_recorded_fixture(h_name)
+            if rec:
+                fake_h = FakeHarness(
+                    name=h_name,
+                    display_name=disp,
+                    summary=str(rec.get("summary") or f"Completed via {disp}."),
+                    questions=list(
+                        rec.get("questions")
+                        or ["Should we use Redis-backed token rotation or in-memory caching?"]
+                    ),
+                    writes={
+                        f: "# Replayed from L1 sandbox fixture\n"
+                        for f in (rec.get("files_changed") or ["src/module.py"])
+                    },
+                    diff_summary=str(
+                        rec.get("diff_summary") or "1 file changed (+2 -0) in worktree."
+                    ),
+                )
+            else:
+                fake_h = FakeHarness(
+                    name=h_name,
+                    display_name=disp,
+                    summary=f"Implemented requested changes via {disp} and verified all unit tests pass.",
+                    questions=[
+                        "Should we use Redis-backed token rotation or in-memory caching?"
+                    ],
+                    writes={"src/module.py": "def execute() -> bool:\n    return True\n"},
+                    diff_summary="1 file changed (+2 -0) in worktree.",
+                )
             reg.register_harness(fake_h)
 
         factory_mod._active_worker = SandboxWorker(

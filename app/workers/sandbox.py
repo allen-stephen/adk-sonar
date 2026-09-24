@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from app.workers.base import WorkerBackend, WorkerExecutionResult
+from app.workers.base import ApprovalCommitResult, WorkerBackend, WorkerExecutionResult
 from app.workers.harnesses import (
     CodingHarness,
     HarnessEvent,
@@ -126,7 +126,11 @@ class SandboxWorker(WorkerBackend):
         import httpx
         import vertexai
 
+        from dotenv import load_dotenv
+
         from app.auth import persist_env_vars
+
+        load_dotenv()
 
         sb_project = (
             os.getenv("SANDBOX_GCP_PROJECT")
@@ -182,20 +186,36 @@ class SandboxWorker(WorkerBackend):
             except Exception:
                 pass
 
-        # Dynamically discover or resolve the parent ReasoningEngine and Sandbox Template
+        # Dynamically discover or resolve the parent ReasoningEngine and Sandbox Template.
+        # Prefer the parent engine embedded in `pinned_sb` first, then scan engines that
+        # actually own at least one sandboxEnvironmentTemplate.
         engine_name = os.getenv("AGENT_ENGINE_RESOURCE_NAME", "").strip()
-        if not engine_name:
-            for eng in client.agent_engines.list():
-                res = getattr(eng, "api_resource", None)
-                if res and getattr(res, "name", None):
-                    engine_name = str(res.name)
-                    break
+        if not engine_name and "/sandboxEnvironments/" in pinned_sb:
+            engine_name = pinned_sb.split("/sandboxEnvironments/")[0]
 
         template_name = os.getenv("SANDBOX_TEMPLATE_RESOURCE_NAME", "").strip()
-        if not template_name and engine_name:
-            tmpls = list(client.agent_engines.sandboxes.templates.list(name=engine_name))
-            if tmpls:
-                template_name = str(tmpls[-1].name)
+        if engine_name and not template_name:
+            try:
+                tmpls = list(client.agent_engines.sandboxes.templates.list(name=engine_name))
+                if tmpls:
+                    template_name = str(tmpls[-1].name)
+            except Exception:
+                pass
+
+        if not template_name:
+            for eng in client.agent_engines.list():
+                res = getattr(eng, "api_resource", None)
+                cand_engine = str(res.name) if (res and getattr(res, "name", None)) else ""
+                if not cand_engine:
+                    continue
+                try:
+                    tmpls = list(client.agent_engines.sandboxes.templates.list(name=cand_engine))
+                    if tmpls:
+                        engine_name = cand_engine
+                        template_name = str(tmpls[-1].name)
+                        break
+                except Exception:
+                    continue
 
         op = client.agent_engines.sandboxes.create(
             name=engine_name,
@@ -247,8 +267,18 @@ class SandboxWorker(WorkerBackend):
                 ),
                 None,
             )
+            seed_spec = next(
+                (
+                    r
+                    for r in manifest.get("seed_repositories", [])
+                    if isinstance(r, dict) and r.get("name") == slug
+                ),
+                None,
+            )
             git_url = str((repo_spec or {}).get("git_url") or "").strip()
-            default_branch = str((repo_spec or {}).get("branch") or "main").strip()
+            default_branch = str(
+                (repo_spec or seed_spec or {}).get("branch") or "main"
+            ).strip()
 
             token = (
                 os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
@@ -260,36 +290,73 @@ class SandboxWorker(WorkerBackend):
                 else ""
             )
 
-            disable_remote_git = os.getenv("ORCHESTRATOR_DISABLE_HOST_GIT", "").lower() in {
+            hermetic = os.getenv("ORCHESTRATOR_HERMETIC_SANDBOX", "").lower() in {
                 "1",
                 "true",
                 "yes",
             }
+            disable_remote_git = hermetic or (
+                os.getenv("ORCHESTRATOR_DISABLE_HOST_GIT", "").lower()
+                in {"1", "true", "yes"}
+            )
+
+            seed_files_cmds: list[str] = []
+            seed_files = (seed_spec or {}).get("files")
+            if isinstance(seed_files, dict) and seed_files:
+                for rel_path, file_content in seed_files.items():
+                    rel_str = str(rel_path).lstrip("/")
+                    parent_dir = str(Path(rel_str).parent)
+                    if parent_dir and parent_dir != ".":
+                        seed_files_cmds.append(f"mkdir -p {shlex.quote(parent_dir)}")
+                    seed_files_cmds.append(
+                        f"printf %s {shlex.quote(str(file_content))} > {shlex.quote(rel_str)}"
+                    )
+            seed_init_str = (
+                " && ".join(seed_files_cmds)
+                if seed_files_cmds
+                else f"echo '# {slug}' > README.md"
+            )
+
             if disable_remote_git or not git_url:
                 setup_cmd = (
                     f"mkdir -p /workspace/{slug} /workspace/.worktrees && "
                     f"cd /workspace/{slug} && "
-                    f"([ -d .git ] || (git init -b {default_branch} && "
-                    f"git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
-                    f"echo '# {slug}' > README.md && git add . && git commit -m 'init')) && "
+                    f"if [ ! -d .git ] || [ ! -f .sonar_seeded ]; then "
+                    f"  ([ -d .git ] || git init -b {default_branch}) && "
+                    f"  git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"  {seed_init_str} && touch .sonar_seeded && "
+                    f"  git add -A && (git commit -m 'seed {slug}' >/dev/null 2>&1 || true); "
+                    f"fi && "
+                    f"git worktree remove --force /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || true; "
+                    f"rm -rf /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || true; "
                     f"git worktree prune >/dev/null 2>&1 || true; "
                     f"(git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || "
                     f"mkdir -p /workspace/.worktrees/{shlex.quote(task_id)})"
                 )
             else:
+                git_auth_cfg = (
+                    f"git config http.https://github.com/.extraHeader {shlex.quote(f'Authorization: Bearer {token}')} && "
+                    f"(printf '%s\\n' {shlex.quote(token)} | gh auth login --with-token >/dev/null 2>&1 || true) && "
+                    if token
+                    else ""
+                )
                 setup_cmd = (
                     f"mkdir -p /workspace/{slug} /workspace/.worktrees && "
                     f"cd /workspace/{slug} && "
                     f"if [ -d .git ]; then "
                     f"  (git remote get-url origin >/dev/null 2>&1 || git remote add origin {shlex.quote(git_url)}) && "
                     f"  git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"  {git_auth_cfg}"
                     f"  GIT_TERMINAL_PROMPT=0 git {auth_header} fetch --all --prune --quiet 2>/dev/null || true; "
                     f"else "
-                    f"  git config user.email 'agent@sonar.local' && git config user.name 'ADK Sonar' && "
+                    f"  git config --global user.email 'agent@sonar.local' && git config --global user.name 'ADK Sonar' && "
                     f"  (GIT_TERMINAL_PROMPT=0 git {auth_header} clone --quiet {shlex.quote(git_url)} . 2>/dev/null || "
                     f"   (git init -b {default_branch} && git remote add origin {shlex.quote(git_url)} && "
-                    f"    GIT_TERMINAL_PROMPT=0 git {auth_header} fetch --all --prune --quiet 2>/dev/null || true)); "
+                    f"    GIT_TERMINAL_PROMPT=0 git {auth_header} fetch --all --prune --quiet 2>/dev/null || true)) && "
+                    f"  {git_auth_cfg}true; "
                     f"fi && "
+                    f"git worktree remove --force /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || true; "
+                    f"rm -rf /workspace/.worktrees/{shlex.quote(task_id)} >/dev/null 2>&1 || true; "
                     f"git worktree prune >/dev/null 2>&1 || true; "
                     f"(git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} origin/{default_branch} >/dev/null 2>&1 || "
                     f" git worktree add -B {shlex.quote(branch_name)} /workspace/.worktrees/{shlex.quote(task_id)} HEAD >/dev/null 2>&1 || "
@@ -297,6 +364,75 @@ class SandboxWorker(WorkerBackend):
                 )
 
             await exec_in_sandbox(context, setup_cmd, timeout_s=30.0)
+
+    async def commit_and_push_task(
+        self,
+        *,
+        task_id: str,
+        branch: str,
+        message: str,
+        worktree_path: str | None = None,
+    ) -> ApprovalCommitResult:
+        """Commit and push an approved task branch inside the sandbox container."""
+        try:
+            sandbox_info = await self._ensure_sandbox()
+        except Exception as exc:
+            return ApprovalCommitResult(
+                committed=False,
+                pushed=False,
+                detail=f"Sandbox unavailable: {exc}",
+            )
+
+        context = SandboxContext(
+            user_id="default_user",
+            sandbox_name=sandbox_info["sandbox_name"],
+            lb_host=sandbox_info["lb_host"],
+            routing_token=sandbox_info["routing_token"],
+            sandbox_token=sandbox_info["sandbox_token"],
+            http_transport=self._http_transport,
+        )
+
+        wt = worktree_path or f"/workspace/.worktrees/{task_id}"
+        token = (
+            os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+            or os.getenv("GH_TOKEN", "").strip()
+        )
+        auth_header = (
+            f'-c http.extraHeader="Authorization: Bearer {token}" ' if token else ""
+        )
+        # Markers let us distinguish "nothing staged" from "commit failed" and
+        # "pushed" from "no remote", instead of collapsing everything to `|| true`.
+        commit_cmd = (
+            f"cd {shlex.quote(wt)} 2>/dev/null || {{ echo '__NO_WORKTREE__'; exit 0; }}; "
+            "git add -A >/dev/null 2>&1; "
+            'if git diff --cached --quiet 2>/dev/null; then echo "__NOTHING_STAGED__"; else '
+            "git -c user.name=VoiceOrchestrator -c user.email=orchestrator@example.com "
+            f"commit -m {shlex.quote(message)} >/dev/null 2>&1 "
+            '&& echo "__COMMITTED__" || echo "__COMMIT_FAILED__"; fi; '
+            f"GIT_TERMINAL_PROMPT=0 git {auth_header}push -u origin {shlex.quote(branch)} "
+            '--quiet >/dev/null 2>&1 && echo "__PUSHED__" || echo "__PUSH_FAILED__"'
+        )
+        res = await exec_in_sandbox(context, commit_cmd, timeout_s=60.0)
+        out = res.stdout or ""
+
+        if "__NO_WORKTREE__" in out:
+            return ApprovalCommitResult(
+                committed=False, pushed=False, detail=f"Worktree {wt} not found."
+            )
+
+        committed = "__COMMITTED__" in out
+        pushed = "__PUSHED__" in out
+        if "__NOTHING_STAGED__" in out:
+            detail = "No uncommitted changes to commit."
+        elif "__COMMIT_FAILED__" in out:
+            detail = "Commit failed in the sandbox."
+        elif committed:
+            detail = "Committed in the sandbox."
+        else:
+            detail = (res.error or "Commit status unknown.").strip()
+        if not pushed:
+            detail = f"{detail} Push failed or no remote configured.".strip()
+        return ApprovalCommitResult(committed=committed, pushed=pushed, detail=detail)
 
     async def _push_task_branch_to_remote(
         self,
@@ -433,9 +569,16 @@ class SandboxWorker(WorkerBackend):
                 session_id=session_id,
                 on_event=on_event,
             )
+            hermetic = os.getenv("ORCHESTRATOR_HERMETIC_SANDBOX", "").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
             if (
                 result.exit_code == 0
                 and mode == "execute"
+                and not require_approval
+                and not hermetic
                 and not use_host_worktree
             ):
                 await self._push_task_branch_to_remote(context, task_id, branch_name)

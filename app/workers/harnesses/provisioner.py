@@ -295,6 +295,11 @@ def get_default_provision_recipe(
     if harness_name == "horizon":
         manifest_spec = _manifest_sandbox_section().get("horizon_package_spec")
         pkg_spec = os.getenv("HORIZON_PACKAGE_SPEC") or manifest_spec or HORIZON_GITHUB_SPEC
+        proj_id = (
+            os.getenv("SANDBOX_GCP_PROJECT")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or ""
+        ).strip()
         spawn_py = (
             "import subprocess, os, sys, signal, time; "
             "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
@@ -304,6 +309,11 @@ def get_default_provision_recipe(
             "stderr=subprocess.STDOUT, start_new_session=True, close_fds=True); "
             "open('/tmp/horizon.pid', 'w').write(str(p.pid))"
         )
+        # Horizon resolves its root model at server start (horizon/models/selector.py
+        # reads LHA_ROOT_MODEL), so pinning must happen here rather than per request.
+        # Unset leaves the harness default. Valid names come from its MODEL_REGISTRY.
+        lha_model = os.getenv("LHA_ROOT_MODEL", "").strip()
+        lha_model_env = f"LHA_ROOT_MODEL={shlex.quote(lha_model)} " if lha_model else ""
         return {
             "version": "git:main@latest",
             "source_url": pkg_spec,
@@ -315,7 +325,12 @@ def get_default_provision_recipe(
                     f"(curl -fsSL http://127.0.0.1:{a2a_port}/.well-known/agent-card.json >/dev/null 2>&1) || "
                     "(([ -f /tmp/horizon.pid ] && kill $(cat /tmp/horizon.pid) 2>/dev/null || true); "
                     "LHA_ENVIRONMENT_BACKEND=local USE_IN_MEMORY_SESSION=true "
-                    f"USE_IN_MEMORY_TASK_STORE=true APP_URL=http://127.0.0.1:{a2a_port} "
+                    f"USE_IN_MEMORY_TASK_STORE=true GOOGLE_GENAI_USE_VERTEXAI=TRUE "
+                    f"{lha_model_env}"
+                    f"GOOGLE_CLOUD_PROJECT={shlex.quote(proj_id)} "
+                    f"GOOGLE_CLOUD_LOCATION=global "
+                    f"GOOGLE_APPLICATION_CREDENTIALS=/workspace/.sonar/application_default_credentials.json "
+                    f"APP_URL=http://127.0.0.1:{a2a_port} "
                     f'nohup python3 -c "{spawn_py}" >/dev/null 2>&1 & sleep 2)'
                 ),
             ],
@@ -337,7 +352,9 @@ def get_default_provision_recipe(
             "health_probe": f"{prof.path_prelude()}agy --version",
             "commands": [
                 f"{prof.path_prelude()}command -v agy >/dev/null 2>&1 || "
-                "(curl -fsSL https://antigravity.google/cli/install.sh | bash)",
+                "(curl -fsSL https://antigravity.google/cli/install.sh | bash); "
+                'mkdir -p "$HOME/.gemini/antigravity-cli" && '
+                'printf \'{"modelProvider":"gemini"}\\n\' > "$HOME/.gemini/antigravity-cli/settings.json"',
             ],
         }
     return {
@@ -569,7 +586,7 @@ class SandboxProvisioner:
                         task_id=task_id,
                         harness=harness.name,
                         kind="progress",
-                        message=start_msg,
+                        message=f"Verifying {harness.display_name} environment...",
                     )
                 )
 
@@ -608,7 +625,7 @@ class SandboxProvisioner:
                         task_id=task_id,
                         harness=harness.name,
                         kind="progress",
-                        message=ready_msg,
+                        message=f"{harness.display_name} environment ready",
                     )
                 )
             return state

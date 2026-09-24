@@ -96,6 +96,8 @@ class TaskStore:
             "repo": handle.repo,
             "harness": handle.harness,
             "mode": handle.mode,
+            "require_approval": bool(getattr(handle, "require_approval", False)),
+            "dismissed": bool(getattr(handle, "dismissed", False)),
             "branch": handle.branch,
             "worktree_path": handle.worktree_path,
             "status": handle.status,
@@ -172,33 +174,59 @@ class TaskStore:
         status: str,
         ended: bool = False,
     ) -> TaskRecord | None:
-        """Updates task status."""
+        """Updates task status without clobbering an existing ended_at timestamp."""
         record = await self.get_task(identifier)
         if not record:
             return None
+        values: dict[str, Any] = {
+            "status": status,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        if ended:
+            values["ended_at"] = datetime.datetime.now(datetime.timezone.utc)
         async with self._session_factory() as session:
             stmt = (
                 update(TaskRecord)
                 .where(TaskRecord.id == record.id)
-                .values(
-                    status=status,
-                    ended_at=datetime.datetime.now(datetime.timezone.utc) if ended else None,
-                )
+                .values(**values)
             )
             await session.execute(stmt)
             await session.commit()
             return await self.get_task(record.id)
 
+    async def mark_task_dismissed(self, identifier: str) -> bool:
+        """Persistently marks a task as dismissed so it is excluded from future briefings and UI cards."""
+        record = await self.get_task(identifier)
+        if not record:
+            return False
+        async with self._session_factory() as session:
+            await session.execute(
+                update(TaskRecord)
+                .where(TaskRecord.id == record.id)
+                .values(dismissed=True, updated_at=datetime.datetime.now(datetime.timezone.utc))
+            )
+            await session.commit()
+        return True
+
     async def reconcile_orphaned_tasks(self) -> int:
-        """Marks any in-flight 'running' tasks from a previous server session as failed/interrupted."""
+        """Marks any in-flight 'running' or 'queued' tasks and runs from a previous server process as orphaned."""
         await self.ensure_initialized()
         now = datetime.datetime.now(datetime.timezone.utc)
         async with self._session_factory() as session:
+            await session.execute(
+                update(RunRecord)
+                .where(RunRecord.status.in_(["queued", "launching", "running"]))
+                .values(
+                    status="orphaned",
+                    summary="Run was interrupted by server shutdown or restart.",
+                    ended_at=now,
+                )
+            )
             stmt = (
                 update(TaskRecord)
-                .where(TaskRecord.status == "running")
+                .where(TaskRecord.status.in_(["running", "queued"]))
                 .values(
-                    status="failed",
+                    status="orphaned",
                     summary="Task was interrupted by server shutdown or restart.",
                     ended_at=now,
                 )

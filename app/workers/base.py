@@ -25,6 +25,20 @@ class WorkerExecutionResult:
     worktree_path: str | None = None
     harness: str = "claude"
     events: list[str] = field(default_factory=list)
+    artifacts: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ApprovalCommitResult:
+    """Outcome of committing and pushing an approved task branch.
+
+    Reported honestly so the voice layer can say what actually happened instead
+    of asserting a commit and push that may never have run.
+    """
+
+    committed: bool
+    pushed: bool
+    detail: str = ""
 
 
 @runtime_checkable
@@ -48,4 +62,15 @@ class WorkerBackend(Protocol):
 
     async def cancel_task(self, task_id: str) -> bool:
         """Cancel an in-flight task by ID."""
+        ...
+
+    async def commit_and_push_task(
+        self,
+        *,
+        task_id: str,
+        branch: str,
+        message: str,
+        worktree_path: str | None = None,
+    ) -> ApprovalCommitResult:
+        """Commit the task's worktree and push its branch, reporting what actually happened."""
         ...

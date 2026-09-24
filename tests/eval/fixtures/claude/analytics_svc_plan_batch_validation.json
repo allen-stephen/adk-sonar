@@ -1,0 +1,29 @@
+{
+  "eval_case_id": "analytics_svc_plan_batch_validation",
+  "harness": "claude",
+  "repo": "analytics-svc",
+  "mode": "plan",
+  "expected_files": [
+    "src/pipeline/batcher.py",
+    "tests/test_batcher.py"
+  ],
+  "wall_clock_s": 0.0,
+  "exit_code": 0,
+  "summary": "Inspected analytics-svc files src/pipeline/batcher.py, tests/test_batcher.py and prepared a read-only implementation plan.",
+  "response_text": "Plan for analytics_svc_plan_batch_validation: 1. Update module with target helper; 2. Add unit test coverage and verify with pytest.",
+  "error": null,
+  "claude_session_id": null,
+  "files_changed": [],
+  "questions": [
+    "Should default TTL remain 900 seconds?"
+  ],
+  "awaiting_input": true,
+  "awaiting_approval": false,
+  "diff_summary": null,
+  "raw_diff": null,
+  "branch": "agent/eval-claude-analytics_svc_plan_batch_validation-1790139979",
+  "worktree_path": "/workspace/.worktrees/eval-claude-analytics_svc_plan_batch_validation-1790139979",
+  "pytest_exit_code": 0,
+  "pytest_stdout": "2 passed in 0.12s (dry-run)",
+  "reference": "The plan must remain strictly read-only (zero modified files), identify flush_telemetry_batch in src/pipeline/batcher.py, propose filtering out empty dict records prior to min(len(valid_events), max_batch_size), and list unit test cases for tests/test_batcher.py."
+}

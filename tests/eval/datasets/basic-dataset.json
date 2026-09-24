@@ -1,6 +1,17 @@
 {
   "eval_cases": [
     {
+      "eval_case_id": "casual_greeting_persona",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hi there"
+          }
+        ]
+      }
+    },
+    {
       "eval_case_id": "discover_repositories",
       "prompt": {
         "role": "user",

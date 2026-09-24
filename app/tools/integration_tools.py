@@ -390,6 +390,150 @@ async def spotify_playback(
         return f"Error communicating with Spotify API: {exc}"
 
 
+_WEEKDAY_MAP = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _resolve_calendar_time_bounds(
+    time_window: str,
+    now_local: datetime,
+    *,
+    has_search_query: bool = False,
+) -> tuple[datetime, datetime, str]:
+    """Resolve (timeMin, timeMax, window_label) anchored to `now_local` in the user's selected timezone."""
+    from datetime import timedelta
+
+    tw = (time_window or "today").strip().lower()
+    user_tz = now_local.tzinfo
+    end_of_today = now_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    if tw in {"today", "rest of today", "now", "tonight", "this afternoon", "this evening"}:
+        if has_search_query and tw == "today":
+            # When searching for a specific named meeting with the default 'today' arg, look ahead 14 days
+            return now_local, now_local + timedelta(days=14), "the next 2 weeks"
+        return now_local, end_of_today, "the rest of today"
+
+    if tw == "this morning":
+        morning_end = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+        return now_local, (morning_end if now_local < morning_end else end_of_today), "this morning"
+
+    if "tomorrow" in tw:
+        tmr = (now_local + timedelta(days=1)).date()
+        t_min = datetime(tmr.year, tmr.month, tmr.day, 0, 0, 0, tzinfo=user_tz)
+        t_max = datetime(tmr.year, tmr.month, tmr.day, 23, 59, 59, tzinfo=user_tz)
+        return t_min, t_max, "tomorrow"
+
+    if tw in {"this week", "this_week", "week"}:
+        days_left = max(6 - now_local.weekday(), 1)
+        end_d = (now_local + timedelta(days=days_left)).date()
+        t_max = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=user_tz)
+        return now_local, t_max, "this week"
+
+    if tw in {"next week", "next_week"}:
+        days_to_mon = (7 - now_local.weekday()) % 7 or 7
+        next_mon = (now_local + timedelta(days=days_to_mon)).date()
+        next_sun = next_mon + timedelta(days=6)
+        t_min = datetime(next_mon.year, next_mon.month, next_mon.day, 0, 0, 0, tzinfo=user_tz)
+        t_max = datetime(next_sun.year, next_sun.month, next_sun.day, 23, 59, 59, tzinfo=user_tz)
+        return t_min, t_max, "next week"
+
+    for day_name, weekday_idx in _WEEKDAY_MAP.items():
+        if day_name in tw:
+            delta_days = (weekday_idx - now_local.weekday()) % 7
+            if delta_days == 0 and "next" in tw:
+                delta_days = 7
+            target_d = (now_local + timedelta(days=delta_days)).date()
+            t_min = (
+                now_local
+                if delta_days == 0
+                else datetime(target_d.year, target_d.month, target_d.day, 0, 0, 0, tzinfo=user_tz)
+            )
+            t_max = datetime(target_d.year, target_d.month, target_d.day, 23, 59, 59, tzinfo=user_tz)
+            return t_min, t_max, day_name.capitalize()
+
+    return now_local, now_local + timedelta(days=7), time_window or "the upcoming week"
+
+
+def _self_rsvp_status(ev: dict[str, Any]) -> str:
+    """Return the authenticated user's RSVP status ('accepted', 'declined', 'tentative', 'needsAction')."""
+    attendees = ev.get("attendees") or []
+    for att in attendees:
+        if isinstance(att, dict) and att.get("self") is True:
+            return str(att.get("responseStatus") or "accepted")
+    return "accepted"
+
+
+def _filter_and_rank_calendar_events(
+    items: list[dict[str, Any]],
+    *,
+    now_local: datetime,
+    query: str = "",
+) -> list[dict[str, Any]]:
+    """Filter out working locations, tasks/free reminders, declined invites, and already-ended events."""
+    q_lower = (query or "").strip().lower()
+    wants_pending = any(w in q_lower for w in ("pending", "invite", "tentative", "unresponded", "rsvp"))
+    wants_all_day = any(w in q_lower for w in ("all day", "all-day", "holiday", "ooo", "out of office", "task", "reminder"))
+    user_tz = now_local.tzinfo
+
+    confirmed: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+
+    for ev in items:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("status") == "cancelled":
+            continue
+        ev_type = str(ev.get("eventType") or "default")
+        if ev_type in {"workingLocation", "birthday", "focusTime", "fromGmail"} and not wants_all_day:
+            continue
+
+        # Exclude "Show as: Free" (transparent) reminder/task blocks unless specifically queried
+        if str(ev.get("transparency") or "opaque").lower() == "transparent" and not wants_all_day:
+            continue
+
+        rsvp = _self_rsvp_status(ev)
+        if rsvp == "declined" and "declined" not in q_lower:
+            continue
+
+        start_obj = ev.get("start") or {}
+        end_obj = ev.get("end") or {}
+        raw_dt = start_obj.get("dateTime")
+        raw_end_dt = end_obj.get("dateTime")
+
+        # Skip all-day banners/tasks unless explicitly asked for
+        if not raw_dt and not wants_all_day:
+            continue
+
+        # Drop timed events that have already ended relative to the user's current local clock
+        if raw_end_dt:
+            try:
+                end_dt = datetime.fromisoformat(raw_end_dt.replace("Z", "+00:00")).astimezone(user_tz)
+                if end_dt <= now_local:
+                    continue
+            except Exception:
+                pass
+
+        if rsvp in {"needsAction", "tentative"}:
+            if wants_pending:
+                confirmed.append(ev)
+            else:
+                pending.append(ev)
+        else:
+            confirmed.append(ev)
+
+    if confirmed:
+        return confirmed
+    # Only fall back to pending invites if there are zero confirmed meetings (or user asked for invites)
+    return pending
+
+
 async def calendar_events(
     action: str = "list",
     query: str = "",
@@ -423,7 +567,8 @@ async def calendar_events(
     prefs = get_runtime_preferences()
     user_tz = ZoneInfo(prefs["timezone"])
     headers = get_workspace_headers(token)
-    now_iso = datetime.now(UTC).isoformat()
+    now_local = datetime.now(user_tz)
+    now_clock_str = now_local.strftime(f"%-I:%M %p {prefs['tz_abbrev']}")
 
     try:
         async with get_http_client(timeout=8.0) as client:
@@ -442,7 +587,7 @@ async def calendar_events(
 
                         record_context_surface(
                             kind="google_calendar",
-                            title=f"Google Calendar · Scheduled",
+                            title="Google Calendar · Scheduled",
                             subtitle=created_summary,
                             brand_icon="google_calendar",
                             badge=prefs["tz_abbrev"],
@@ -468,12 +613,19 @@ async def calendar_events(
                     )
                 return f"Google Calendar API returned {r.status_code}: {r.text[:200]}"
 
-            params: dict[str, str | int] = {
-                "timeMin": now_iso,
+            time_min_dt, time_max_dt, window_label = _resolve_calendar_time_bounds(
+                time_window,
+                now_local,
+                has_search_query=bool(query.strip() and act != "check_availability"),
+            )
+            params: dict[str, Any] = {
+                "timeMin": time_min_dt.isoformat(),
+                "timeMax": time_max_dt.isoformat(),
                 "timeZone": prefs["timezone"],
-                "maxResults": 5,
+                "maxResults": 25,
                 "singleEvents": "true",
                 "orderBy": "startTime",
+                "eventTypes": "default",
             }
             if query.strip() and act != "check_availability":
                 params["q"] = query.strip()
@@ -483,7 +635,12 @@ async def calendar_events(
                 headers=headers,
             )
             if r.status_code == 200:
-                items = r.json().get("items") or []
+                raw_items = r.json().get("items") or []
+                items = _filter_and_rank_calendar_events(
+                    raw_items,
+                    now_local=now_local,
+                    query=query,
+                )
                 if not items:
                     try:
                         from app.api_routes import record_context_surface
@@ -491,26 +648,33 @@ async def calendar_events(
                         record_context_surface(
                             kind="google_calendar",
                             title=f"Google Calendar · {prefs['tz_abbrev']}",
-                            subtitle=f"Schedule clear for {time_window}",
+                            subtitle=f"Schedule clear for {window_label}",
                             brand_icon="google_calendar",
                             badge="Clear",
-                            bullets=[f"No upcoming events or conflicts for {time_window} ({prefs['timezone']})."],
+                            bullets=[
+                                f"As of {now_clock_str}, no confirmed meetings for {window_label} ({prefs['timezone']})."
+                            ],
                             meta={
                                 "empty_state": True,
                                 "status_label": "Schedule Clear",
-                                "time_window": time_window,
+                                "time_window": window_label,
                                 "tz_abbrev": prefs["tz_abbrev"],
                             },
                             surface_id="a2ui-ctx-calendar",
                         )
                     except Exception:
                         pass
-                    return f"You have no upcoming events on your Google Calendar for {time_window} ({prefs['timezone']})."
+                    return (
+                        f"As of {now_clock_str}, you have no confirmed upcoming meetings on your Google Calendar "
+                        f"for {window_label} ({prefs['timezone']})."
+                    )
                 summaries = []
                 bullets = []
                 cal_items = []
-                for ev in items[:4]:
+                for ev in items[:5]:
                     title = ev.get("summary") or "Untitled event"
+                    rsvp = _self_rsvp_status(ev)
+                    rsvp_tag = " [Pending invite]" if rsvp in {"needsAction", "tentative"} else ""
                     raw_dt = (ev.get("start") or {}).get("dateTime")
                     raw_end_dt = (ev.get("end") or {}).get("dateTime")
                     raw_date = (ev.get("start") or {}).get("date")
@@ -518,12 +682,18 @@ async def calendar_events(
                     start_short = raw_date or "All day"
                     end_short = ""
                     date_label = ""
+                    relative_hint = ""
                     if raw_dt:
                         try:
                             dt_obj = datetime.fromisoformat(raw_dt.replace("Z", "+00:00")).astimezone(user_tz)
                             start_str = dt_obj.strftime(f"%a %b %-d at %-I:%M %p {prefs['tz_abbrev']}")
                             start_short = dt_obj.strftime("%-I:%M %p")
                             date_label = dt_obj.strftime("%a, %b %-d")
+                            mins_away = int((dt_obj - now_local).total_seconds() // 60)
+                            if mins_away <= 0:
+                                relative_hint = "in progress now, "
+                            elif mins_away <= 90:
+                                relative_hint = f"in {mins_away} min, "
                         except Exception:
                             pass
                     if raw_end_dt:
@@ -532,16 +702,16 @@ async def calendar_events(
                             end_short = end_obj.strftime("%-I:%M %p")
                         except Exception:
                             pass
-                    summaries.append(f"{title} ({start_str})")
-                    bullets.append(f"{title} · {start_str}")
+                    summaries.append(f"{title}{rsvp_tag} ({relative_hint}{start_str})")
+                    bullets.append(f"{title}{rsvp_tag} · {start_str}")
                     cal_items.append(
                         {
-                            "title": title,
+                            "title": f"{title}{rsvp_tag}",
                             "start_time": start_short,
                             "end_time": end_short,
                             "date_label": date_label,
                             "location": ev.get("location"),
-                            "meet_url": ev.get("hangoutLink") or ev.get("htmlLink"),
+                            "meet_url": ev.get("hangoutLink") or ev_json.get("htmlLink") if "ev_json" in locals() else ev.get("htmlLink"),
                             "attendees_count": len(ev.get("attendees") or []),
                         }
                     )
@@ -551,7 +721,7 @@ async def calendar_events(
                     record_context_surface(
                         kind="google_calendar",
                         title=f"Google Calendar · {prefs['tz_abbrev']}",
-                        subtitle=f"{len(items)} upcoming {'event' if len(items) == 1 else 'events'}",
+                        subtitle=f"{len(items)} upcoming {'meeting' if len(items) == 1 else 'meetings'} ({window_label})",
                         brand_icon="google_calendar",
                         badge=prefs["tz_abbrev"],
                         bullets=bullets,
@@ -561,7 +731,10 @@ async def calendar_events(
                     )
                 except Exception:
                     pass
-                return f"Upcoming on your Google Calendar ({prefs['timezone']}): {'; '.join(summaries)}."
+                return (
+                    f"As of {now_clock_str} ({prefs['timezone']}), upcoming on your Google Calendar for {window_label}: "
+                    f"{'; '.join(summaries)}."
+                )
             if r.status_code in {401, 403}:
                 return (
                     "Your Google token does not have Google Calendar permission yet. "
@@ -976,6 +1149,17 @@ async def _resolve_authenticated_github_user(
     return None
 
 
+def _extract_github_slug_from_git_url(git_url: str) -> str | None:
+    """Extract 'owner/repo' from a GitHub HTTPS or SSH URL."""
+    url = git_url.strip().removesuffix(".git").rstrip("/")
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if url.startswith(prefix):
+            slug = url[len(prefix) :].strip("/")
+            if slug.count("/") == 1:
+                return slug.lower()
+    return None
+
+
 def _resolve_github_owner_and_repo(
     raw_repo: str, gh_user: str | None
 ) -> tuple[str, str | None, str]:
@@ -988,7 +1172,19 @@ def _resolve_github_owner_and_repo(
         owner, rname = cleaned.split("/", 1)
         fork_slug = f"{gh_user}/{rname}" if gh_user else None
         return rname, fork_slug, f"{owner}/{rname}"
+
     fork_slug = f"{gh_user}/{cleaned}" if gh_user else None
+    try:
+        from app.workers.harnesses.base import load_workspaces_manifest
+
+        manifest = load_workspaces_manifest()
+        for entry in manifest.get("repositories", []):
+            if isinstance(entry, dict) and str(entry.get("name") or "").strip().lower() == cleaned:
+                slug = _extract_github_slug_from_git_url(str(entry.get("git_url") or ""))
+                if slug:
+                    return cleaned, fork_slug, slug
+    except Exception:
+        pass
     return cleaned, fork_slug, f"google/{cleaned}"
 
 
@@ -1021,7 +1217,8 @@ async def github_operations(
     act = action.strip().lower()
     target_repo = repo.strip() or "adk-python"
     token = (
-        os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+        await ensure_fresh_access_token("github")
+        or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
         or os.getenv("GH_TOKEN", "").strip()
     )
     if not token:
@@ -1281,6 +1478,14 @@ async def github_operations(
                 headers=headers,
             )
             up_prs = (r_up.json() or []) if r_up.status_code == 200 else []
+            if not up_prs and fork_slug and fork_slug != upstream_slug:
+                r_fork_prs = await client.get(
+                    f"https://api.github.com/repos/{fork_slug}/pulls",
+                    params={"state": "open", "per_page": 4},
+                    headers=headers,
+                )
+                if r_fork_prs.status_code == 200:
+                    up_prs = r_fork_prs.json() or []
 
             parts: list[str] = []
             bullets: list[str] = []

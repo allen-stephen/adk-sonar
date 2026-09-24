@@ -167,3 +167,81 @@ def test_routing_dataset_and_eval_metric_alignment():
             },
         }
         assert evaluate_fn(neg_instance)["score"] == 0.0
+
+
+def test_calendar_timezone_bounds_and_event_filtering():
+    """Verify Google Calendar filtering drops working locations, tasks/free reminders, declined invites, and ended meetings."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.tools.integration_tools import (
+        _filter_and_rank_calendar_events,
+        _resolve_calendar_time_bounds,
+    )
+
+    tz = ZoneInfo("America/Chicago")
+    now_local = datetime(2026, 9, 23, 14, 0, 0, tzinfo=tz)  # 2:00 PM CDT
+
+    t_min, t_max, label = _resolve_calendar_time_bounds("today", now_local)
+    assert t_min == now_local
+    assert t_max.hour == 23 and t_max.minute == 59
+    assert label == "the rest of today"
+
+    tmr_min, tmr_max, tmr_label = _resolve_calendar_time_bounds("tomorrow", now_local)
+    assert tmr_min.day == 24 and tmr_min.hour == 0
+    assert tmr_max.day == 24 and tmr_max.hour == 23
+    assert tmr_label == "tomorrow"
+
+    raw_items = [
+        # 1. Working location banner -> dropped
+        {
+            "summary": "Home",
+            "eventType": "workingLocation",
+            "start": {"date": "2026-09-23"},
+            "end": {"date": "2026-09-24"},
+        },
+        # 2. All-day task/reminder hold (transparent/Free) -> dropped
+        {
+            "summary": "Submit Q3 expense report",
+            "transparency": "transparent",
+            "start": {"dateTime": "2026-09-23T15:00:00-05:00"},
+            "end": {"dateTime": "2026-09-23T15:30:00-05:00"},
+        },
+        # 3. Declined meeting -> dropped
+        {
+            "summary": "Optional Vendor Sync",
+            "start": {"dateTime": "2026-09-23T15:30:00-05:00"},
+            "end": {"dateTime": "2026-09-23T16:00:00-05:00"},
+            "attendees": [{"email": "me@example.com", "self": True, "responseStatus": "declined"}],
+        },
+        # 4. Already-ended morning meeting (10:00 AM - 10:30 AM CDT) -> dropped
+        {
+            "summary": "Morning Standup",
+            "start": {"dateTime": "2026-09-23T10:00:00-05:00"},
+            "end": {"dateTime": "2026-09-23T10:30:00-05:00"},
+        },
+        # 5. Unresponded pending invite -> deprioritized when confirmed meetings exist
+        {
+            "summary": "Cold Sales Intro",
+            "start": {"dateTime": "2026-09-23T16:00:00-05:00"},
+            "end": {"dateTime": "2026-09-23T16:30:00-05:00"},
+            "attendees": [{"email": "me@example.com", "self": True, "responseStatus": "needsAction"}],
+        },
+        # 6. Confirmed upcoming meeting (3:00 PM - 3:45 PM CDT) -> kept!
+        {
+            "summary": "Architecture Design Review",
+            "start": {"dateTime": "2026-09-23T15:00:00-05:00"},
+            "end": {"dateTime": "2026-09-23T15:45:00-05:00"},
+            "attendees": [{"email": "me@example.com", "self": True, "responseStatus": "accepted"}],
+        },
+    ]
+
+    filtered = _filter_and_rank_calendar_events(raw_items, now_local=now_local)
+    assert [ev["summary"] for ev in filtered] == ["Architecture Design Review"]
+
+    # If the user explicitly asks for pending invites, pending invites are included
+    pending_filtered = _filter_and_rank_calendar_events(
+        raw_items, now_local=now_local, query="pending invites"
+    )
+    assert "Cold Sales Intro" in [ev["summary"] for ev in pending_filtered]
+
